@@ -1,0 +1,5 @@
+.claude/
+*.log
+.DS_Store
+preview/.comments/
+.comments/
