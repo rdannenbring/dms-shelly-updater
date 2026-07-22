@@ -25,6 +25,9 @@ PluginComponent {
     readonly property bool alwaysConfirmKernel: pluginData.alwaysConfirmKernel !== undefined ? pluginData.alwaysConfirmKernel : false
     readonly property string iconDefault: pluginData.iconDefault || "check_circle"
     readonly property string iconUpdates: pluginData.iconUpdates || "system_update_alt"
+    // Failures get their own GLYPH, not just a color — bar theming can render
+    // icon colors nearly indistinguishable, so shape carries the signal.
+    readonly property string iconFailures: pluginData.iconFailures || "release_alert"
     readonly property bool showCount: pluginData.showCount !== undefined ? pluginData.showCount : true
     readonly property string countPositionH: pluginData.countPositionH || "right" // left | right
     readonly property string countPositionV: pluginData.countPositionV || "bottom" // top | bottom
@@ -36,11 +39,13 @@ PluginComponent {
     readonly property bool showOpenShellyMenuItem: pluginData.showOpenShellyMenuItem !== undefined ? pluginData.showOpenShellyMenuItem : true
     readonly property bool notifyOnUpdates: pluginData.notifyOnUpdates !== undefined ? pluginData.notifyOnUpdates : false
     readonly property int notifyThreshold: parseInt(pluginData.notifyThreshold !== undefined ? pluginData.notifyThreshold : 1)
+    readonly property bool notifyOnFailures: pluginData.notifyOnFailures !== undefined ? pluginData.notifyOnFailures : true
     readonly property string leftClickAction: pluginData.leftClickAction || "updates" // updates | menu | ui | none
     readonly property string middleClickAction: pluginData.middleClickAction || "none"
     readonly property string rightClickAction: pluginData.rightClickAction || "menu"
     readonly property string terminal: pluginData.terminal || Quickshell.env("TERMINAL") || "kitty"
     readonly property bool closeTerminalOnDone: pluginData.closeTerminalOnDone !== undefined ? pluginData.closeTerminalOnDone : false
+    readonly property bool surviveRestart: pluginData.surviveRestart !== undefined ? pluginData.surviveRestart : true
     readonly property bool detectFailedUpdates: pluginData.detectFailedUpdates !== undefined ? pluginData.detectFailedUpdates : true
     // Retention for the self-kept failed-update log (days). Capped by the
     // settings slider; clamped defensively here too.
@@ -50,6 +55,34 @@ PluginComponent {
     readonly property bool limitBuildResources: pluginData.limitBuildResources !== undefined ? pluginData.limitBuildResources : false
     readonly property bool lowerPriority: pluginData.lowerPriority !== undefined ? pluginData.lowerPriority : true
     readonly property int maxBuildJobs: parseInt(pluginData.maxBuildJobs !== undefined ? pluginData.maxBuildJobs : 0) // 0 = unlimited
+    // AI failure analysis: a user-configured shell command that reads a prompt
+    // on stdin and prints a plain-text answer (e.g. "claude -p", "ollama run
+    // llama3.2"). A CLI keeps API keys out of the plugin's plain-JSON state and
+    // lets subscription accounts work without API credits.
+    readonly property bool aiEnabled: pluginData.aiEnabled !== undefined ? pluginData.aiEnabled : false
+    readonly property string aiCommand: (pluginData.aiCommand || "").trim()
+    readonly property bool aiReady: aiEnabled && aiCommand !== ""
+    // User-editable prompt template ({placeholders} filled per failure). An
+    // empty/unset setting means the built-in default below. KEEP IN SYNC with
+    // the copy in ShellyUpdaterSettings.qml (settings can't read this file).
+    readonly property string aiPromptDefault: [
+        "You are helping diagnose a failed package update on a Linux system.",
+        "The update was run through the Shelly package manager (wraps pacman/AUR/Flatpak/AppImage).",
+        "",
+        "System environment:",
+        "{environment}",
+        "",
+        "Package: {package} (source: {source})",
+        "Attempted: {oldVersion} -> {newVersion}",
+        "Failure reason (updater's classification): {reason}",
+        "",
+        "Tail of the captured update log:",
+        "{log}",
+        "",
+        "Briefly explain what went wrong, then give concrete numbered fix steps the user can run.",
+        "Plain text only — no markdown syntax. Keep it under 200 words."
+    ].join("\n")
+    readonly property string aiPromptTemplate: (pluginData.aiPromptTemplate || "").trim() !== "" ? pluginData.aiPromptTemplate : aiPromptDefault
 
     // ---- Live state ----
     property var pacmanUpdates: []
@@ -157,6 +190,9 @@ PluginComponent {
     // session log so the user can see why. Broadcast so every monitor agrees.
     property var attemptedUpdate: []          // names submitted to the last upgrade
     property var failedPackages: []           // names that didn't apply
+    // "The last run left failures" — drives the bar glyph, the updates-view
+    // banner, and the failure notification. Cleared when a new upgrade starts.
+    readonly property bool hasFailures: failedPackages.length > 0
     property bool _awaitingUpgradeResult: false
     property int _lastUpgradeExit: 0
     property string _lastLogText: ""          // captured session output of last run
@@ -220,7 +256,8 @@ PluginComponent {
     }
     // Append the just-detected failures (with version/source resolved from the
     // still-pending update list) and persist + broadcast the pruned log.
-    function _recordFailures(failedNames, reason, cleanLog) {
+    // reasonByName overrides `reason` for specific packages (mixed-cause runs).
+    function _recordFailures(failedNames, reason, cleanLog, reasonByName) {
         if (!failedNames || failedNames.length === 0)
             return;
         var pool = root.pacmanUpdates.concat(root.aurUpdates).concat(root.flatpakUpdates).concat(root.appimageUpdates);
@@ -238,7 +275,7 @@ PluginComponent {
                 source: it.source || "pacman",
                 oldVersion: it.oldVersion || "",
                 newVersion: it.newVersion || "",
-                reason: reason || "",
+                reason: (reasonByName && reasonByName[failedNames[j]]) || reason || "",
                 log: excerpt
             });
         }
@@ -274,6 +311,14 @@ PluginComponent {
     // detection and the "View log" action).
     readonly property string logPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/shelly-updater-last.log"
     readonly property string statusPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/shelly-updater-last.status"
+    // The update terminal is launched DETACHED (Quickshell.execDetached) so it
+    // survives a DMS crash/restart. Since a detached process gives no exit
+    // callback, the terminal writes this per-run token to donePath when it ends
+    // (via a shell trap, so it fires on normal exit or window-close); the plugin
+    // polls donePath and matches the token to know the run finished.
+    readonly property string donePath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/shelly-updater-last.done"
+    property double _runToken: 0
+    property bool _awaitingTerminal: false
 
     // Each monitor gets its own plugin instance with independent state. A local
     // refresh() only updates this instance; refreshAll() broadcasts to every
@@ -358,7 +403,40 @@ PluginComponent {
     // update notifications — a manual refresh means the user is already looking.
     property bool _bgCheck: false
 
+    // An external package operation (a terminal `yay`/`pacman -Syu`, or any
+    // makepkg build) is in progress. `shelly aur list-updates` STALLS for the
+    // entire build — measured ~30s+ during a big -git build — which would pin
+    // isChecking=true and leave the pill spinning the whole time. So we probe
+    // for an in-progress update before every check and, when one is running,
+    // skip this cycle (keep current data, no spinner) and re-probe on a short
+    // timer; the moment the build finishes the retry runs a real check.
+    property bool _externalBusy: false
+    property bool _probing: false
+    property bool _pendingBg: false
+
     function refresh(isBackground) {
+        if (isChecking || isUpgrading || _probing)
+            return;
+        _pendingBg = isBackground === true;
+        _probing = true;
+        busyProbe.running = true;
+    }
+
+    // busyProbe result: `busy` = a pacman transaction (db.lck) or a makepkg /
+    // pacman process is running right now.
+    function _onBusyProbe(busy) {
+        if (!_probing)
+            return; // already handled (stdout + onExited can both fire)
+        _probing = false;
+        if (busy) {
+            _externalBusy = true; // busyRetry timer polls until it clears
+            return;
+        }
+        _externalBusy = false;
+        _doRefresh(_pendingBg);
+    }
+
+    function _doRefresh(isBackground) {
         if (isChecking || isUpgrading)
             return;
         isChecking = true;
@@ -379,6 +457,34 @@ PluginComponent {
             q.push({ src: "appimage", cmd: ["shelly", "appimage", "list-updates", "--json"] });
         _checkQueue = q;
         _runNextCheck();
+    }
+
+    // Cheap "is a system update running?" probe. db.lck covers an active
+    // pacman/yay transaction; `pgrep -x makepkg` covers the (long) AUR build
+    // phase, which holds no db lock; `pgrep -x pacman` covers a bare -Sy sync.
+    Process {
+        id: busyProbe
+        command: ["sh", "-c",
+            "if [ -e /var/lib/pacman/db.lck ] || pgrep -x makepkg >/dev/null 2>&1 || pgrep -x pacman >/dev/null 2>&1; then echo busy; else echo free; fi"]
+        stdout: StdioCollector {
+            onStreamFinished: root._onBusyProbe((text || "").trim() === "busy")
+        }
+        stderr: StdioCollector {
+            onStreamFinished: {}
+        }
+        // Fallback: if the probe couldn't produce output, don't get wedged —
+        // proceed as if free (the check itself will just run as before).
+        onExited: root._onBusyProbe(false)
+    }
+
+    // While an external update is running, re-probe periodically so the widget
+    // refreshes on its own shortly after the build/transaction finishes.
+    Timer {
+        id: busyRetry
+        interval: 15000
+        repeat: true
+        running: root._externalBusy
+        onTriggered: root.refresh(root._pendingBg)
     }
 
     function _runNextCheck() {
@@ -500,15 +606,59 @@ PluginComponent {
         var work = detectFailedUpdates
             ? "script -qe -c " + _shq(cmd) + " " + _shq(logPath) + "; echo $? > " + _shq(statusPath)
             : cmd;
-        // With closeTerminalOnDone the window exits as soon as the run finishes;
-        // otherwise it holds open on a "Press Enter" prompt.
-        var inner = closeTerminalOnDone
+        // Signal completion via a marker file since a detached process has no
+        // exit callback. A trap writes the token on normal exit AND on
+        // window-close signals, so the poller never hangs.
+        _runToken = Date.now();
+        var doneCmd = "echo " + _runToken + " > " + _shq(donePath);
+        // With closeTerminalOnDone the window exits as soon as the run finishes
+        // (the EXIT trap then fires the marker). Otherwise the window holds open
+        // on a "Press Enter" prompt — but we emit the marker RIGHT AFTER the work
+        // finishes (status + log are already written by then), so the counts
+        // refresh immediately instead of waiting for the user to close the
+        // window. The EXIT trap remains a fallback for a window closed mid-run.
+        var body = closeTerminalOnDone
             ? work
-            : work + "; echo; echo '── " + (title || "Done") + " ── Press Enter to close'; read _";
-        termProc.command = terminal.split(" ").concat(["-e", "sh", "-c", inner]);
+            : work + "; " + doneCmd + "; echo; echo '── " + (title || "Done") + " ── Press Enter to close'; read _";
+        var inner = "trap " + _shq(doneCmd) + " EXIT; trap exit HUP TERM INT; " + body;
+        Quickshell.execDetached(_launchArgv(inner));
         isUpgrading = true;
         _writeUpgradeBeat(Date.now()); // broadcast "updating" to all monitors
-        termProc.running = true;
+        _awaitingTerminal = true; // start polling for the completion marker
+    }
+
+    // Build the argv for the update terminal. With surviveRestart the terminal
+    // is placed in its OWN systemd scope (its own cgroup, a sibling of
+    // dms.service) so `dms restart` — which kills the dms.service cgroup —
+    // leaves it running. Detach (execDetached) alone is NOT enough: the process
+    // is reparented but stays in dms.service's cgroup and dies with the service.
+    function _launchArgv(inner) {
+        var words = terminal.split(" ").filter(function (s) { return s.length; });
+        var base = (words[0] || "").split("/").pop();
+        // Single-instance terminals hand the window to a shared process (which
+        // may live under dms.service); force a standalone instance so the window
+        // is its own process inside our scope. ghostty is the common one.
+        var standalone = [];
+        if (base === "ghostty")
+            standalone = ["--gtk-single-instance=false"];
+        var termArgv = words.concat(standalone).concat(["-e", "sh", "-c", inner]);
+        if (!surviveRestart)
+            return termArgv;
+        var pfx = _survivePrefix();
+        return pfx.length ? pfx.concat(termArgv) : termArgv;
+    }
+
+    // Launcher prefix that puts the terminal in its own systemd scope. Honors a
+    // user/DMS-configured launch prefix, else defaults to systemd-run.
+    function _survivePrefix() {
+        var p = "";
+        if (typeof SettingsData !== "undefined" && SettingsData.launchPrefix)
+            p = String(SettingsData.launchPrefix).trim();
+        if (!p)
+            p = Quickshell.env("DMS_DEFAULT_LAUNCH_PREFIX") || "";
+        if (!p)
+            p = "systemd-run --user --scope --quiet --";
+        return p.split(" ").filter(function (s) { return s.length; });
     }
 
     // Single-quote a string for safe embedding in the sh -c command line.
@@ -607,16 +757,40 @@ PluginComponent {
     function cleanCache() { runInTerminal(["shelly", "cache-clean"], "Clean Package Cache", false); }
     function removeOrphans() { runInTerminal(["shelly", "purify"], "Remove Orphans", false); }
 
+    // Poll the detached terminal's completion marker. `cat` prints the token the
+    // trap wrote; matching it to this run's token means the terminal finished.
+    Timer {
+        id: donePoller
+        interval: 3000
+        repeat: true
+        running: root._awaitingTerminal
+        onTriggered: doneCheckProc.running = true
+    }
     Process {
-        id: termProc
-        onExited: {
-            root.isUpgrading = false;
-            root._writeUpgradeBeat(0); // stop the "updating" animation everywhere
-            if (root._awaitingUpgradeResult)
-                statusProc.running = true; // read exit code, then re-check
-            else
-                root.refreshAll();
+        id: doneCheckProc
+        command: ["cat", root.donePath]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                if ((text || "").trim() === String(root._runToken)) {
+                    root._awaitingTerminal = false;
+                    root._onTerminalDone();
+                }
+            }
         }
+        stderr: StdioCollector {
+            onStreamFinished: {}
+        }
+    }
+
+    // Runs when the detached update terminal finishes (marker detected). Mirrors
+    // what the old termProc.onExited did.
+    function _onTerminalDone() {
+        isUpgrading = false;
+        _writeUpgradeBeat(0); // stop the "updating" animation everywhere
+        if (_awaitingUpgradeResult)
+            statusProc.running = true; // read exit code + log, then re-check
+        else
+            refreshAll();
     }
 
     // Reads the exit code the terminal stashed, then reads the captured log,
@@ -665,9 +839,16 @@ PluginComponent {
     //
     //   1. Per-package build failures print "· (n/m) failed <pkg>" — pin those
     //      exactly (correctly leaves succeeded -git packages unflagged).
-    //   2. A transaction/hard-error marker (no per-package line) means the run
+    //   2. AUR builds cancelled because the PKGBUILD changed print "Cancelled
+    //      because of pkgbuild diff." but still end in "Update complete." with
+    //      exit 0 (with --no-confirm Shelly can't prompt for review, so it
+    //      skips the build and reports success). Attribute each cancel marker
+    //      to the nearest preceding ":: (n/m) downloading <pkg>" line.
+    //   3. A transaction/hard-error marker (no per-package line) means the run
     //      failed but didn't name a culprit — flag every attempted package
     //      still pending (incl. devel, since nothing applied).
+    readonly property string reasonPkgbuildDiff: "PKGBUILD changed — review required"
+    readonly property string reasonDepConflict: "Dependency conflict — coordinated rebuild needed"
     function _computeFailed() {
         var clean = _stripAnsi(root._lastLogText);
         var names = {};
@@ -678,7 +859,30 @@ PluginComponent {
             names[m[1]] = true;
         var hasPerPkg = Object.keys(names).length > 0;
 
+        var cancelled = {};
+        var dlRe = /::\s*\(\d+\/\d+\)\s+downloading\s+([A-Za-z0-9@._+\-]+)/g;
+        var dls = [];
+        while ((m = dlRe.exec(clean)) !== null)
+            dls.push({ idx: m.index, name: m[1] });
+        var cancelRe = /cancelled because of pkgbuild diff/gi;
+        while ((m = cancelRe.exec(clean)) !== null) {
+            var who = "";
+            for (var d = 0; d < dls.length && dls[d].idx < m.index; d++)
+                who = dls[d].name;
+            if (who)
+                cancelled[who] = true;
+        }
+
         var hardFail = /transaction failed|upgrade failed|==>\s*error:|\berror:\s|failed to (?:build|commit|prepare|install|synchronize)/i.test(clean);
+
+        // A dependency/soname conflict: pacman refuses the transaction because an
+        // upgrade needs a newer shared library than a held or AUR package provides
+        // (e.g. the hypr* -git stack crossing a libhyprutils soname bump). Held
+        // packages aren't upgraded but still constrain resolution, so the whole
+        // group has to be rebuilt together. Label it distinctly so the failure
+        // detail view can show targeted recovery guidance instead of a bare error.
+        var depConflict = /breaks dependency/i.test(clean)
+            && /could not satisfy dependencies|failed to prepare transaction/i.test(clean);
 
         if (!hasPerPkg && (hardFail || root._lastUpgradeExit !== 0)) {
             var shownNames = _namesOf(allShownItems());
@@ -690,12 +894,22 @@ PluginComponent {
         }
 
         var failed = [];
+        var reasonByName = {};
         for (var k in names)
             failed.push(k);
+        for (var c in cancelled) {
+            if (!names[c])
+                failed.push(c);
+            reasonByName[c] = root.reasonPkgbuildDiff;
+        }
         root.failedPackages = failed;
-        var reason = hasPerPkg ? "Build failed" : (hardFail ? "Transaction failed" : (root._lastUpgradeExit !== 0 ? "Update failed" : "Did not apply"));
-        _recordFailures(failed, reason, clean);
+        var reason = hasPerPkg ? "Build failed"
+            : (depConflict ? root.reasonDepConflict
+            : (hardFail ? "Transaction failed"
+            : (root._lastUpgradeExit !== 0 ? "Update failed" : "Did not apply")));
+        _recordFailures(failed, reason, clean, reasonByName);
         root._broadcastFailed();
+        _notifyFailures(failed);
     }
     function _broadcastFailed() {
         if (pluginService && pluginService.savePluginState)
@@ -821,7 +1035,9 @@ PluginComponent {
         return { title: item.name, source: item.source, description: desc, fields: fields };
     }
 
-    function openDetail(item) {
+    // Load a package's detail into shared state (no navigation) — used by both
+    // the bar popout (openDetail) and the control-center detail sub-view.
+    function loadDetail(item) {
         if (!item)
             return;
         root.detailItem = item;
@@ -843,6 +1059,12 @@ PluginComponent {
             root.detailData = root._buildDetail(item, null);
             root.detailLoading = false;
         }
+    }
+
+    function openDetail(item) {
+        if (!item)
+            return;
+        loadDetail(item);
         root.popoutMode = "detail";
         if (!root.popoutOpen)
             triggerPopout();
@@ -992,8 +1214,33 @@ PluginComponent {
     function openFailureDetail(entry) {
         if (!entry)
             return;
+        root.aiError = "";
         root.failureDetail = entry;
         openMode("faildetail");
+    }
+    // One-click path to the last run's failures (banner button, notification
+    // action): a single failure jumps straight to its detail view, several go
+    // to the history list (failed rows at top by recency). History is loaded
+    // either way so the detail view's back button lands somewhere populated.
+    function openFailures(runAi) {
+        loadFailureHistory();
+        loadHistory();
+        var entry = null;
+        if (root.failedPackages.length === 1) {
+            for (var i = 0; i < root.failureHistory.length; i++) {
+                if (root.failureHistory[i].name === root.failedPackages[0]) {
+                    entry = root.failureHistory[i];
+                    break; // list is newest-first, so this is the latest record
+                }
+            }
+        }
+        if (entry) {
+            openFailureDetail(entry);
+            if (runAi === true && root.aiReady && !entry.ai)
+                requestAiSuggestion();
+        } else {
+            openMode("history");
+        }
     }
     function closeFailureDetail() {
         openMode("history");
@@ -1064,6 +1311,151 @@ PluginComponent {
         id: notifyProc
     }
 
+    // Failure notification — fired by the instance that ran the upgrade (so no
+    // cross-monitor de-dup is needed). notify-send's -A flag makes it wait and
+    // print the chosen action key, letting the user jump straight from the
+    // notification to the failure details (optionally with the AI breakdown).
+    function _notifyFailures(failed) {
+        if (!notifyOnFailures || !failed || failed.length === 0)
+            return;
+        var summary = failed.length === 1
+            ? failed[0] + " failed to update"
+            : failed.length + " updates failed";
+        var names = failed.slice(0, 8).join(", ") + (failed.length > 8 ? " …" : "");
+        var cmd = ["notify-send", "-a", "Shelly Updater", "-i", "dialog-error",
+                   "-A", "details=View details"];
+        if (aiReady)
+            cmd.push("-A", "ai=Explain with AI");
+        cmd.push(summary, names);
+        failNotifyProc.command = cmd;
+        failNotifyProc.running = true;
+    }
+    Process {
+        id: failNotifyProc
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var action = (text || "").trim();
+                if (action === "details")
+                    root.openFailures(false);
+                else if (action === "ai")
+                    root.openFailures(true);
+            }
+        }
+        stderr: StdioCollector {
+            onStreamFinished: {}
+        }
+    }
+
+    // =====================================================================
+    // AI failure analysis. The configured command runs via sh with the prompt
+    // passed as a positional arg and piped to its stdin — no temp files, no
+    // shell-escaping of the prompt, no API keys handled by the plugin.
+    // =====================================================================
+    property bool aiLoading: false
+    property string aiError: ""
+    property string _aiStdout: ""
+    property string _aiStderr: ""
+
+    // Fill the template. split/join instead of String.replace so log content
+    // containing "$&"-style sequences can't corrupt the substitution.
+    function _aiPrompt(entry) {
+        function fill(t, key, val) { return t.split("{" + key + "}").join(val); }
+        var t = root.aiPromptTemplate;
+        t = fill(t, "environment", root.environmentInfo !== "" ? root.environmentInfo : "(environment details unavailable)");
+        t = fill(t, "package", entry.name || "?");
+        t = fill(t, "source", entry.source || "?");
+        t = fill(t, "oldVersion", entry.oldVersion || "?");
+        t = fill(t, "newVersion", entry.newVersion || "?");
+        t = fill(t, "reason", entry.reason || "unknown");
+        t = fill(t, "log", entry.log && entry.log !== "" ? entry.log : "(no log was saved)");
+        return t;
+    }
+
+    // Detected once at load: distro (incl. Arch derivative), kernel, arch, and
+    // Shelly version — the parts of the environment that change what fix is
+    // correct. Filled into the {environment} prompt placeholder. Read-only
+    // probe, so it doesn't need the shelly db flock.
+    property string environmentInfo: ""
+    Process {
+        id: envProc
+        command: ["sh", "-c",
+            "{ . /etc/os-release 2>/dev/null; " +
+            "echo \"OS: ${PRETTY_NAME:-${NAME:-Linux}}\"; " +
+            "[ -n \"$ID_LIKE\" ] && echo \"Based on: $ID_LIKE\"; " +
+            "echo \"Kernel: $(uname -r)\"; " +
+            "echo \"Architecture: $(uname -m)\"; " +
+            "v=$(shelly --version 2>/dev/null | head -n1); [ -n \"$v\" ] && echo \"Shelly: $v\"; " +
+            "[ -n \"$XDG_CURRENT_DESKTOP\" ] && echo \"Desktop: $XDG_CURRENT_DESKTOP\"; }"]
+        stdout: StdioCollector {
+            onStreamFinished: root.environmentInfo = (text || "").trim()
+        }
+        stderr: StdioCollector {
+            onStreamFinished: {}
+        }
+    }
+
+    function requestAiSuggestion() {
+        if (!aiReady || aiLoading || !root.failureDetail)
+            return;
+        root.aiError = "";
+        root._aiStdout = "";
+        root._aiStderr = "";
+        root.aiLoading = true;
+        aiProc.command = ["sh", "-c", "printf '%s' \"$1\" | ( " + aiCommand + " )", "shelly-ai", _aiPrompt(root.failureDetail)];
+        aiProc.running = true;
+    }
+    function cancelAiSuggestion() {
+        if (aiProc.running)
+            aiProc.running = false;
+        root.aiLoading = false;
+    }
+    Process {
+        id: aiProc
+        stdout: StdioCollector {
+            onStreamFinished: root._aiStdout = text || ""
+        }
+        stderr: StdioCollector {
+            onStreamFinished: root._aiStderr = text || ""
+        }
+        onExited: (exitCode) => root._aiFinished(exitCode)
+    }
+    function _aiFinished(exitCode) {
+        if (!root.aiLoading)
+            return; // cancelled
+        root.aiLoading = false;
+        var out = (root._aiStdout || "").trim();
+        if (out === "") {
+            var err = (root._aiStderr || "").trim().split("\n").slice(-3).join("\n");
+            root.aiError = exitCode !== 0
+                ? ("AI command failed (exit " + exitCode + ")" + (err ? ":\n" + err : ""))
+                : "AI command produced no output.";
+            return;
+        }
+        if (out.length > 6000)
+            out = out.slice(0, 6000) + " …";
+        _saveAiResult(out);
+    }
+    // Attach the answer to the failure record so it survives view changes and
+    // restarts, and shows on every monitor.
+    function _saveAiResult(answer) {
+        var e = root.failureDetail;
+        if (!e)
+            return;
+        var list = root.failureHistory.slice();
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].name === e.name && list[i].when === e.when) {
+                var upd = JSON.parse(JSON.stringify(list[i]));
+                upd.ai = answer;
+                list[i] = upd;
+                root.failureDetail = upd;
+                break;
+            }
+        }
+        root.failureHistory = list;
+        if (pluginService && pluginService.savePluginState)
+            pluginService.savePluginState(pluginId, "failureHistory", JSON.stringify(root.failureHistory));
+    }
+
     function openPluginSettings() {
         if (typeof PopoutService !== "undefined" && PopoutService.openSettings)
             PopoutService.openSettings();
@@ -1130,6 +1522,16 @@ PluginComponent {
 
     Component.onCompleted: {
         loadFailureHistory();
+        envProc.running = true; // detect {environment} for AI prompts
+        // Restore the last run's failure flags so a DMS restart doesn't hide
+        // that something went wrong (they clear when the next upgrade starts).
+        if (pluginService && pluginService.loadPluginState) {
+            try {
+                root.failedPackages = JSON.parse(pluginService.loadPluginState(pluginId, "failedPackages", "[]"));
+            } catch (e) {
+                // keep default
+            }
+        }
         if (checkAtStartup)
             Qt.callLater(function () { root.refresh(true); });
     }
@@ -1236,6 +1638,8 @@ PluginComponent {
         if (hasError)
             return "Shelly: error\n" + errorMessage;
         lines.push(updateCount === 0 ? "System up to date" : "Total updates: " + updateCount);
+        if (hasFailures)
+            lines.push("⚠ Failed last run: " + failedPackages.join(", "));
         lines.push("Pacman: " + pacmanUpdatesShown.length);
         if (enableAur)
             lines.push("AUR: " + aurUpdatesShown.length);
@@ -1346,11 +1750,13 @@ PluginComponent {
                     if (root.isUpgrading || root.remoteUpgrading) return "sync";
                     if (root.isChecking) return "refresh";
                     if (root.hasError) return "error";
+                    if (root.hasFailures) return root.iconFailures;
                     return root.updateCount > 0 ? root.iconUpdates : root.iconDefault;
                 }
                 size: Theme.barIconSize(root.barThickness, -4, root.barConfig?.noBackground)
                 color: {
                     if (root.hasError) return Theme.error;
+                    if (root.hasFailures && !(root.isChecking || root.isUpgrading || root.remoteUpgrading)) return Theme.error;
                     if (root.updateCount > 0 || root.isChecking || root.isUpgrading || root.remoteUpgrading) return Theme.primary;
                     return Theme.surfaceText;
                 }
@@ -1470,6 +1876,1160 @@ PluginComponent {
     // pillClickAction, and adds middle-click support the framework lacks.
 
     // =====================================================================
+    // Shared views (Menu + Updates list) — top-level so BOTH the bar popout
+    // and the control-center panel can instantiate them from one source.
+    // They emit dismissRequested() instead of touching the popout directly,
+    // and take `embedded` to hide popout-only chrome in the control center.
+    // =====================================================================
+    component FailBannerButton: Rectangle {
+        id: fbb
+        property string icon: ""
+        property string label: ""
+        signal clicked()
+        width: fbbRow.implicitWidth + Theme.spacingM * 2
+        height: 30
+        radius: Theme.cornerRadius
+        color: fbbHover.containsMouse ? Theme.withAlpha(Theme.error, 0.22) : "transparent"
+        border.width: 1
+        border.color: Theme.withAlpha(Theme.error, 0.35)
+        Row {
+            id: fbbRow
+            anchors.centerIn: parent
+            spacing: Theme.spacingXS
+            DankIcon { anchors.verticalCenter: parent.verticalCenter; name: fbb.icon; size: Theme.iconSize - 6; color: Theme.error }
+            StyledText {
+                anchors.verticalCenter: parent.verticalCenter
+                text: fbb.label
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.error
+            }
+        }
+        MouseArea {
+            id: fbbHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: fbb.clicked()
+        }
+    }
+
+    component UpdatesView: Column {
+        id: uv
+        // Host asks to dismiss its surface (bar popout closes; control center
+        // closes). Emitted instead of calling popout.closePopout() directly, so
+        // this view has no knowledge of which surface hosts it.
+        signal dismissRequested()
+        // A row was left-clicked — the host decides where the detail opens
+        // (bar popout → detail mode; control center → its own detail sub-view).
+        signal rowActivated(var item)
+        // Embedded = rendered inside the control-center panel (not the bar
+        // popout): hide popout-only chrome (own header, hint, filter, sort,
+        // internal failure banner, Update All) and don't drill into the
+        // per-package detail view (the CC has no detail Loader).
+        property bool embedded: false
+        // In embedded mode the list has no natural height (no detailRows framing
+        // it), so the host passes the pixel height the list should fill.
+        property real embeddedListHeight: 0
+        readonly property real contentWidth: width - leftPadding - rightPadding
+        width: parent ? parent.width : 0
+        padding: uv.embedded ? 0 : root.popoutPad
+        spacing: uv.embedded ? 0 : Theme.spacingM
+
+        readonly property var allItems: root.allShownItems()
+        readonly property var failedShown: allItems.filter(function (i) { return root._isFailed(i); })
+
+        // Text filter (matches name/description/version/source).
+        property string filterText: ""
+        readonly property var filteredItems: filterText === ""
+            ? allItems
+            : allItems.filter(function (i) { return root._matchesFilter(i, uv.filterText); })
+
+        // Sort: type (pacman→aur→devel→flatpak→appimage) or name.
+        readonly property var displayItems: {
+            var arr = filteredItems.slice();
+            var dir = updSort.asc ? 1 : -1;
+            var key = updSort.activeKey;
+            arr.sort(function (a, b) {
+                var c;
+                if (key === "type") {
+                    c = root._typeRank(a) - root._typeRank(b);
+                    if (c === 0)
+                        c = String(a.name || "").localeCompare(String(b.name || ""));
+                } else {
+                    c = String(a.name || "").localeCompare(String(b.name || ""));
+                }
+                return c * dir;
+            });
+            return arr;
+        }
+
+        // Header
+        Item {
+            width: uv.contentWidth
+            visible: !uv.embedded
+            height: visible ? 44 : 0
+            Column {
+                anchors.left: parent.left
+                anchors.right: headerActions.left
+                anchors.rightMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 1
+                StyledText {
+                    text: "Available Updates"
+                    font.pixelSize: Theme.fontSizeLarge
+                    font.weight: Font.Medium
+                    color: Theme.surfaceText
+                }
+                // Subtitle: normally "checked Nm ago"; while an external
+                // pacman/AUR update is running, an amber notice explaining why
+                // a refresh is being held off (clicking refresh lands here).
+                StyledText {
+                    width: parent.width
+                    text: root._externalBusy
+                        ? "System update in progress — will refresh when it finishes"
+                        : root.lastCheckedText()
+                    visible: text !== ""
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: root._externalBusy ? Theme.warning : Theme.surfaceVariantText
+                    wrapMode: Text.NoWrap
+                    elide: Text.ElideRight
+                }
+            }
+            Row {
+                id: headerActions
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingS
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root._externalBusy ? "Locked" : (root.isChecking ? "Checking…" : (root.updateCount === 0 ? "Up to date" : root.updateCount + (root.updateCount === 1 ? " update" : " updates")))
+                    font.pixelSize: Theme.fontSizeMedium
+                    color: root._externalBusy ? Theme.warning : (root.hasError ? Theme.error : Theme.surfaceVariantText)
+                }
+                DankActionButton {
+                    buttonSize: 28
+                    iconName: "refresh"
+                    iconSize: 18
+                    iconColor: root._externalBusy ? Theme.warning : Theme.surfaceText
+                    enabled: !root.isChecking
+                    opacity: enabled ? 1.0 : 0.5
+                    tooltipText: root._externalBusy
+                        ? "A system update is running — checks are paused until it finishes"
+                        : "Refresh"
+                    onClicked: root.refreshAll()
+                    RotationAnimation on rotation {
+                        from: 0; to: 360; duration: 1000
+                        loops: Animation.Infinite; running: root.isChecking
+                    }
+                }
+            }
+        }
+
+        // Interaction hint — only shown when there are packages that
+        // support the click actions (pacman/AUR rows can be held). Hidden when
+        // embedded (row-click doesn't open detail there).
+        Row {
+            width: uv.contentWidth
+            spacing: Theme.spacingXS
+            visible: !uv.embedded && uv.allItems.length > 0
+            DankIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                name: "info"
+                size: Theme.fontSizeSmall + 2
+                color: Theme.surfaceVariantText
+            }
+            StyledText {
+                width: parent.width - (Theme.fontSizeSmall + 2) - Theme.spacingXS
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Click a package for details · right-click to hold (ignore) it"
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                wrapMode: Text.WordWrap
+            }
+        }
+
+        // Text filter — search the update list by package name,
+        // description, version or source. Shown only when there is
+        // something to filter. Hidden when embedded (the CC panel keeps the
+        // list compact; filtering lives in the full popout).
+        DankTextField {
+            width: uv.contentWidth
+            height: visible ? 40 : 0
+            visible: !uv.embedded && uv.allItems.length > 0
+            leftIconName: "search"
+            showClearButton: true
+            placeholderText: "Filter packages…"
+            text: uv.filterText
+            onTextEdited: uv.filterText = text
+        }
+
+        // Sort selector (type / name).
+        SortChips {
+            id: updSort
+            visible: !uv.embedded && uv.allItems.length > 0
+            height: visible ? implicitHeight : 0
+            activeKey: "type"
+            asc: true
+            options: [ { key: "type", label: "Type" }, { key: "name", label: "Name" } ]
+        }
+
+        // Failure banner — appears whenever the last upgrade left
+        // failures (based on failedPackages, not just visible rows, so
+        // filters/holds can't hide it). "Details" jumps to the failure
+        // record (reason + fix hint + AI); "Log" opens the raw session
+        // output.
+        Rectangle {
+            width: uv.contentWidth
+            visible: !uv.embedded && root.hasFailures
+            height: visible ? 44 : 0
+            radius: Theme.cornerRadius
+            color: Theme.withAlpha(Theme.error, 0.12)
+            border.width: 1
+            border.color: Theme.withAlpha(Theme.error, 0.35)
+
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.spacingM
+                anchors.right: failBtns.left
+                anchors.rightMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingS
+                DankIcon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "error"
+                    size: Theme.iconSize - 4
+                    color: Theme.error
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.max(0, parent.width - (Theme.iconSize - 4) - Theme.spacingS)
+                    text: root.failedPackages.length + (root.failedPackages.length === 1 ? " update didn't apply on the last run" : " updates didn't apply on the last run")
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceText
+                    wrapMode: Text.WordWrap
+                    maximumLineCount: 2
+                    elide: Text.ElideRight
+                }
+            }
+            Row {
+                id: failBtns
+                anchors.right: parent.right
+                anchors.rightMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingXS
+                FailBannerButton { icon: "troubleshoot"; label: "Details"; onClicked: root.openFailures(false) }
+                FailBannerButton { icon: "description"; label: "Log"; onClicked: root.viewLastLog() }
+            }
+        }
+
+        // List — height follows the configured number of rows in the popout,
+        // or fills the control-center panel (embeddedListHeight) when embedded.
+        Rectangle {
+            width: uv.contentWidth
+            height: uv.embedded
+                ? Math.max(root.detailRowHeight, uv.embeddedListHeight)
+                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
+            radius: Theme.cornerRadius
+            color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
+
+            StyledText {
+                anchors.centerIn: parent
+                width: parent.width - Theme.spacingL * 2
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                visible: uv.filteredItems.length === 0
+                text: {
+                    if (uv.allItems.length > 0)
+                        return "No packages match \"" + uv.filterText + "\"";
+                    if (root._externalBusy)
+                        return "A system update is running.\nUpdates will refresh once it finishes.";
+                    return root.isChecking ? "Checking for updates…" : (root.hasError ? ("Failed to check for updates:\n" + root.errorMessage) : "Your system is up to date!");
+                }
+                color: root.hasError && uv.allItems.length === 0 ? Theme.error : Theme.surfaceText
+                font.pixelSize: Theme.fontSizeMedium
+            }
+
+            DankListView {
+                anchors.fill: parent
+                anchors.margins: Theme.spacingS
+                visible: uv.displayItems.length > 0
+                clip: true
+                spacing: Theme.spacingXS
+                model: uv.displayItems
+
+                delegate: Rectangle {
+                    required property var modelData
+                    // VCS/devel AUR packages (churny "latest-commit" updates) get
+                    // a muted "devel" chip + a dimmed row so they recede visually.
+                    readonly property bool rowIsKernel: root._isKernel(modelData)
+                    readonly property bool rowIsDevel: modelData.source === "aur" && root._isDevelAur(modelData)
+                    // Attempted last run but still pending → didn't apply.
+                    readonly property bool rowIsFailed: root._isFailed(modelData)
+                    width: ListView.view ? ListView.view.width : 0
+                    height: root.detailRowHeight
+                    radius: Theme.cornerRadius
+                    color: itemHover.containsMouse ? Theme.primaryHoverLight : (rowIsFailed ? Theme.withAlpha(Theme.error, 0.09) : "transparent")
+
+                    Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+
+                    // Left-click the row (anywhere but the download
+                    // button, which sits on top with its own handler)
+                    // opens the extended package-detail view; right-click
+                    // holds it (pacman/AUR only — where ignore applies).
+                    MouseArea {
+                        id: itemHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: mouse => {
+                            if (mouse.button === Qt.RightButton) {
+                                if (modelData.source === "pacman" || modelData.source === "aur")
+                                    root.holdPackage(modelData.name);
+                            } else {
+                                uv.rowActivated(modelData);
+                            }
+                        }
+                    }
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingM
+                        // Failed devel rows stay full-opacity so they stand out.
+                        opacity: (rowIsDevel && !rowIsFailed) ? 0.55 : 1.0
+
+                        Rectangle {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 52
+                            height: 20
+                            radius: Theme.cornerRadius
+                            color: rowIsFailed ? Theme.withAlpha(Theme.error, 0.22)
+                                : (rowIsKernel ? Theme.withAlpha(Theme.warning, 0.22) : Theme.secondaryHover)
+                            StyledText {
+                                anchors.centerIn: parent
+                                text: rowIsFailed ? "failed" : (rowIsKernel ? "kernel" : (rowIsDevel ? "devel" : modelData.source))
+                                font.pixelSize: Theme.fontSizeSmall - 1
+                                font.weight: (rowIsFailed || rowIsKernel) ? Font.Bold : Font.Normal
+                                color: rowIsFailed ? Theme.error : (rowIsKernel ? Theme.warning : Theme.surfaceVariantText)
+                            }
+                        }
+
+                        Column {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: parent.width - 52 - 32 - Theme.spacingM * 3
+                            spacing: 2
+                            StyledText {
+                                width: parent.width
+                                text: modelData.name
+                                font.pixelSize: Theme.fontSizeMedium
+                                font.weight: Font.Medium
+                                color: Theme.surfaceText
+                                wrapMode: Text.NoWrap
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                            }
+                            StyledText {
+                                width: parent.width
+                                text: {
+                                    var v = (modelData.oldVersion || "?") + " → " + (modelData.newVersion || "?");
+                                    var ds = Number(modelData.downloadSize) || 0;
+                                    if (ds > 0)
+                                        v += "  ·  " + root._fmtBytes(ds);
+                                    return v;
+                                }
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.primary
+                                wrapMode: Text.NoWrap
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                            }
+                            StyledText {
+                                width: parent.width
+                                text: modelData.description
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.surfaceVariantText
+                                wrapMode: Text.NoWrap
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                                visible: modelData.description !== ""
+                            }
+                        }
+
+                        DankActionButton {
+                            anchors.verticalCenter: parent.verticalCenter
+                            buttonSize: 30
+                            iconName: "download"
+                            iconSize: 18
+                            iconColor: Theme.primary
+                            enabled: !root.isUpgrading
+                            onClicked: {
+                                root.updateOne(modelData);
+                                uv.dismissRequested();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update All button (hidden when embedded — the CC panel's Menu tab
+        // already carries Update All and the per-source actions).
+        Rectangle {
+            width: uv.contentWidth
+            visible: !uv.embedded
+            height: visible ? 48 : 0
+            radius: Theme.cornerRadius
+            color: updateAllHover.containsMouse ? Theme.primaryHover : Theme.secondaryHover
+            opacity: root.updateCount > 0 && !root.isUpgrading ? 1.0 : 0.5
+            Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+
+            Row {
+                anchors.centerIn: parent
+                spacing: Theme.spacingS
+                DankIcon { name: "download"; size: Theme.iconSize; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Update All"
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.Medium
+                    color: Theme.primary
+                }
+            }
+            MouseArea {
+                id: updateAllHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                enabled: root.updateCount > 0 && !root.isUpgrading
+                onClicked: {
+                    root.updateAll();
+                    uv.dismissRequested();
+                }
+            }
+        }
+    }
+
+    component SortChips: Row {
+        id: sc
+        property var options: []          // [{ key, label }]
+        property string activeKey: ""
+        property bool asc: true
+        spacing: Theme.spacingXS
+
+        StyledText {
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Sort"
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+        }
+        Repeater {
+            model: sc.options
+            delegate: Rectangle {
+                required property var modelData
+                readonly property bool active: modelData.key === sc.activeKey
+                anchors.verticalCenter: parent.verticalCenter
+                height: 24
+                width: chipRow.implicitWidth + Theme.spacingS * 2
+                radius: Theme.cornerRadius
+                color: active ? Theme.primaryHoverLight : (chHover.containsMouse ? Theme.secondaryHover : "transparent")
+                border.width: active ? 0 : 1
+                border.color: Theme.outlineMedium
+                Row {
+                    id: chipRow
+                    anchors.centerIn: parent
+                    spacing: 2
+                    StyledText {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: modelData.label
+                        font.pixelSize: Theme.fontSizeSmall
+                        font.weight: active ? Font.Medium : Font.Normal
+                        color: active ? Theme.primary : Theme.surfaceVariantText
+                    }
+                    DankIcon {
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: active
+                        name: sc.asc ? "arrow_upward" : "arrow_downward"
+                        size: Theme.fontSizeSmall
+                        color: Theme.primary
+                    }
+                }
+                MouseArea {
+                    id: chHover
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (sc.activeKey === modelData.key)
+                            sc.asc = !sc.asc;
+                        else
+                            sc.activeKey = modelData.key;
+                    }
+                }
+            }
+        }
+    }
+
+    // A single on/off filter chip (e.g. "Failed only").
+    component FilterChip: Rectangle {
+        id: fc
+        property string label: ""
+        property string icon: ""
+        property bool active: false
+        property color activeColor: Theme.primary
+        signal toggled
+        height: 24
+        width: fcRow.implicitWidth + Theme.spacingS * 2
+        radius: Theme.cornerRadius
+        color: active ? Theme.withAlpha(activeColor, 0.18) : (fcHover.containsMouse ? Theme.secondaryHover : "transparent")
+        border.width: active ? 0 : 1
+        border.color: Theme.outlineMedium
+        Row {
+            id: fcRow
+            anchors.centerIn: parent
+            spacing: 3
+            DankIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: fc.icon !== ""
+                name: fc.icon
+                size: Theme.fontSizeSmall
+                color: fc.active ? fc.activeColor : Theme.surfaceVariantText
+            }
+            StyledText {
+                anchors.verticalCenter: parent.verticalCenter
+                text: fc.label
+                font.pixelSize: Theme.fontSizeSmall
+                font.weight: fc.active ? Font.Medium : Font.Normal
+                color: fc.active ? fc.activeColor : Theme.surfaceVariantText
+            }
+        }
+        MouseArea {
+            id: fcHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: fc.toggled()
+        }
+    }
+
+    component MenuView: Column {
+        id: mv
+        // See UpdatesView: dismissRequested() decouples this from its host, and
+        // embedded hides popout-only chrome. In the control center the history
+        // and held-packages entries are hidden — they navigate to popout-only
+        // views the CC panel doesn't host.
+        signal dismissRequested()
+        property bool embedded: false
+        readonly property real contentWidth: width - leftPadding - rightPadding
+        width: parent ? parent.width : 0
+        padding: mv.embedded ? 0 : root.popoutPad
+        spacing: Theme.spacingXS
+
+        Item {
+            width: mv.contentWidth
+            visible: !mv.embedded
+            height: visible ? 32 : 0
+            StyledText {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Shelly Updater"
+                font.pixelSize: Theme.fontSizeLarge
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+            }
+        }
+
+        MenuItem {
+            itemIcon: "download"; itemLabel: "Update All"
+            badge: root.updateCount > 0 ? String(root.updateCount) : ""
+            onTriggered: { root.updateAll(); mv.dismissRequested(); }
+        }
+        MenuItem {
+            itemIcon: "terminal"; itemLabel: "Update System Packages (Pacman)"
+            badge: root.pacmanUpdatesShown.length > 0 ? String(root.pacmanUpdatesShown.length) : ""
+            onTriggered: { root.updatePacman(); mv.dismissRequested(); }
+        }
+        MenuItem {
+            visible: root.enableAur; height: visible ? 44 : 0
+            itemIcon: "deployed_code"; itemLabel: "Update AUR"
+            badge: root.aurUpdatesShown.length > 0 ? String(root.aurUpdatesShown.length) : ""
+            onTriggered: { root.updateAur(); mv.dismissRequested(); }
+        }
+        MenuItem {
+            visible: root.enableFlatpak; height: visible ? 44 : 0
+            itemIcon: "package_2"; itemLabel: "Update Flatpak"
+            badge: root.flatpakUpdates.length > 0 ? String(root.flatpakUpdates.length) : ""
+            onTriggered: { root.updateFlatpak(); mv.dismissRequested(); }
+        }
+        MenuItem {
+            visible: root.enableAppimage; height: visible ? 44 : 0
+            itemIcon: "widgets"; itemLabel: "Update AppImage"
+            badge: root.appimageUpdates.length > 0 ? String(root.appimageUpdates.length) : ""
+            onTriggered: { root.updateAppimage(); mv.dismissRequested(); }
+        }
+
+        Rectangle { width: mv.contentWidth; height: 1; color: Theme.outline; opacity: 0.3 }
+
+        MenuItem {
+            visible: !mv.embedded; height: visible ? 44 : 0
+            itemIcon: "history"; itemLabel: "Update History…"
+            onTriggered: root.openHistory()
+        }
+        MenuItem {
+            visible: !mv.embedded; height: visible ? 44 : 0
+            itemIcon: "block"; itemLabel: "Held Packages…"
+            badge: root.ignoredPackages.length > 0 ? String(root.ignoredPackages.length) : ""
+            onTriggered: root.openHeld()
+        }
+        MenuItem {
+            itemIcon: "cleaning_services"; itemLabel: "Clean Package Cache"
+            onTriggered: { root.cleanCache(); mv.dismissRequested(); }
+        }
+        MenuItem {
+            itemIcon: "delete_sweep"; itemLabel: "Remove Orphans"
+            onTriggered: { root.removeOrphans(); mv.dismissRequested(); }
+        }
+
+        Rectangle { width: mv.contentWidth; height: 1; color: Theme.outline; opacity: 0.3 }
+
+        MenuItem {
+            visible: root.showOpenShellyMenuItem; height: visible ? 44 : 0
+            itemIcon: "open_in_new"; itemLabel: "Open Shelly UI"
+            onTriggered: { root.openShellyUi(); mv.dismissRequested(); }
+        }
+        MenuItem {
+            itemIcon: "settings"; itemLabel: "Settings"
+            onTriggered: { root.openPluginSettings(); mv.dismissRequested(); }
+        }
+    }
+
+    // ---------------- Held-packages manager ----------------
+
+    // =====================================================================
+    // Package-detail view (top-level so the control-center panel can host it
+    // too). backRequested/dismissRequested decouple it from the popout;
+    // embedded + embeddedBodyHeight let it fit the CC panel.
+    // =====================================================================
+    component DetailView: Column {
+        id: dv
+        // backRequested = the back arrow / after a hold (return to the list);
+        // dismissRequested = an action that closes the whole surface (update /
+        // downgrade launches a terminal). Each host wires them to its own nav.
+        signal backRequested()
+        signal dismissRequested()
+        // Embedded in the control-center panel: zero padding and a host-driven
+        // body height (the popout sizes the body from detailRows instead).
+        property bool embedded: false
+        property real embeddedBodyHeight: 0
+        readonly property real contentWidth: width - leftPadding - rightPadding
+        width: parent ? parent.width : 0
+        padding: dv.embedded ? 0 : root.popoutPad
+        spacing: dv.embedded ? Theme.spacingS : Theme.spacingM
+
+        readonly property var detail: root.detailData
+        readonly property var pkg: root.detailItem
+        readonly property bool rowIsKernel: pkg ? root._isKernel(pkg) : false
+
+        // Header: back button + package name + source chip
+        Item {
+            width: dv.contentWidth
+            height: 40
+            DankActionButton {
+                id: backBtn
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                buttonSize: 28
+                iconName: "arrow_back"
+                iconSize: 18
+                iconColor: Theme.surfaceText
+                onClicked: dv.backRequested()
+            }
+            StyledText {
+                anchors.left: backBtn.right
+                anchors.leftMargin: Theme.spacingS
+                anchors.right: srcChip.left
+                anchors.rightMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+                text: dv.pkg ? dv.pkg.name : ""
+                font.pixelSize: Theme.fontSizeLarge
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+                elide: Text.ElideRight
+            }
+            Rectangle {
+                id: srcChip
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: 56
+                height: 20
+                radius: Theme.cornerRadius
+                color: dv.rowIsKernel ? Theme.withAlpha(Theme.warning, 0.22) : Theme.secondaryHover
+                StyledText {
+                    anchors.centerIn: parent
+                    text: dv.rowIsKernel ? "kernel" : (dv.pkg ? dv.pkg.source : "")
+                    font.pixelSize: Theme.fontSizeSmall - 1
+                    font.weight: dv.rowIsKernel ? Font.Bold : Font.Normal
+                    color: dv.rowIsKernel ? Theme.warning : Theme.surfaceVariantText
+                }
+            }
+        }
+
+        // Body: scrollable field list (bounded so the popout height
+        // stays comparable to the other modes; host-driven when embedded).
+        Rectangle {
+            width: dv.contentWidth
+            height: dv.embedded
+                ? Math.max(root.detailRowHeight, dv.embeddedBodyHeight)
+                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
+            radius: Theme.cornerRadius
+            color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
+
+            // Loading / error placeholder
+            Column {
+                anchors.centerIn: parent
+                spacing: Theme.spacingS
+                width: parent.width - Theme.spacingL * 2
+                visible: root.detailLoading || root.detailError !== ""
+                DankIcon {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    name: root.detailError !== "" ? "error" : "hourglass_top"
+                    size: Theme.iconSize
+                    color: root.detailError !== "" ? Theme.error : Theme.surfaceVariantText
+                    RotationAnimation on rotation {
+                        from: 0; to: 360; duration: 1000
+                        loops: Animation.Infinite; running: root.detailLoading
+                    }
+                }
+                StyledText {
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    text: root.detailError !== "" ? root.detailError : "Loading details…"
+                    color: root.detailError !== "" ? Theme.error : Theme.surfaceText
+                    font.pixelSize: Theme.fontSizeMedium
+                }
+            }
+
+            Flickable {
+                id: fieldFlick
+                anchors.fill: parent
+                anchors.margins: Theme.spacingM
+                clip: true
+                visible: !root.detailLoading && root.detailError === "" && dv.detail !== null
+                contentHeight: fieldCol.height
+                contentWidth: width
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                Column {
+                    id: fieldCol
+                    width: fieldFlick.width
+                    spacing: Theme.spacingS
+
+                    // Full-width description
+                    StyledText {
+                        width: parent.width
+                        visible: dv.detail && dv.detail.description !== ""
+                        text: dv.detail ? dv.detail.description : ""
+                        font.pixelSize: Theme.fontSizeMedium
+                        color: Theme.surfaceText
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: 1
+                        color: Theme.outline
+                        opacity: 0.25
+                        visible: dv.detail && dv.detail.description !== "" && dv.detail.fields.length > 0
+                    }
+
+                    // Label / value rows
+                    Repeater {
+                        model: dv.detail ? dv.detail.fields : []
+                        delegate: Row {
+                            required property var modelData
+                            width: fieldCol.width
+                            spacing: Theme.spacingM
+                            StyledText {
+                                width: 104
+                                text: modelData.label
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.surfaceVariantText
+                                wrapMode: Text.WordWrap
+                            }
+                            StyledText {
+                                width: parent.width - 104 - Theme.spacingM
+                                text: modelData.value
+                                font.pixelSize: Theme.fontSizeSmall
+                                font.family: modelData.mono ? Theme.monoFontFamily : Theme.fontFamily
+                                // Link fields render as an underlined,
+                                // primary-colored, clickable URL that
+                                // opens in the default browser.
+                                font.underline: modelData.link === true
+                                color: modelData.link === true ? Theme.primary : Theme.surfaceText
+                                wrapMode: Text.WrapAnywhere
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    enabled: modelData.link === true
+                                    hoverEnabled: enabled
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: Qt.openUrlExternally(modelData.value)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update this package
+        Rectangle {
+            width: dv.contentWidth
+            height: 48
+            radius: Theme.cornerRadius
+            color: detailUpdateHover.containsMouse ? Theme.primaryHover : Theme.secondaryHover
+            opacity: !root.isUpgrading ? 1.0 : 0.5
+            Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+
+            Row {
+                anchors.centerIn: parent
+                spacing: Theme.spacingS
+                DankIcon { name: "download"; size: Theme.iconSize; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Update This Package"
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.Medium
+                    color: Theme.primary
+                }
+            }
+            MouseArea {
+                id: detailUpdateHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                enabled: !root.isUpgrading
+                onClicked: {
+                    root.updateOne(dv.pkg);
+                    dv.dismissRequested();
+                }
+            }
+        }
+
+        // Secondary actions: hold/unhold + downgrade.
+        Row {
+            width: dv.contentWidth
+            spacing: Theme.spacingS
+            readonly property bool isHeld: dv.pkg ? root._isHeld(dv.pkg.name) : false
+            // ignore/downgrade apply to pacman/AUR, not flatpak/appimage.
+            readonly property bool canHold: dv.pkg && (dv.pkg.source === "pacman" || dv.pkg.source === "aur")
+            readonly property bool canDowngrade: canHold
+
+            DetailActionButton {
+                visible: parent.canHold
+                width: parent.canDowngrade ? (parent.width - Theme.spacingS) / 2 : parent.width
+                icon: parent.isHeld ? "check_circle" : "block"
+                label: parent.isHeld ? "Unhold" : "Hold"
+                onTriggered: {
+                    if (parent.isHeld)
+                        root.unholdPackage(dv.pkg.name);
+                    else
+                        root.holdPackage(dv.pkg.name);
+                    dv.backRequested();
+                }
+            }
+            DetailActionButton {
+                visible: parent.canDowngrade
+                width: parent.canHold ? (parent.width - Theme.spacingS) / 2 : parent.width
+                icon: "history"
+                label: "Downgrade"
+                btnEnabled: !root.isUpgrading
+                onTriggered: {
+                    root.downgradeOne(dv.pkg);
+                    dv.dismissRequested();
+                }
+            }
+        }
+    }
+
+    // Small secondary button used in the detail view's action row.
+    component DetailActionButton: Rectangle {
+        property string icon: ""
+        property string label: ""
+        property bool btnEnabled: true
+        signal triggered
+        height: 40
+        radius: Theme.cornerRadius
+        color: dabHover.containsMouse ? Theme.primaryHoverLight : Theme.secondaryHover
+        opacity: btnEnabled ? 1.0 : 0.5
+        Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+        Row {
+            anchors.centerIn: parent
+            spacing: Theme.spacingXS
+            DankIcon { name: icon; size: Theme.iconSize - 2; color: Theme.surfaceText; anchors.verticalCenter: parent.verticalCenter }
+            StyledText {
+                anchors.verticalCenter: parent.verticalCenter
+                text: label
+                font.pixelSize: Theme.fontSizeMedium
+                color: Theme.surfaceText
+            }
+        }
+        MouseArea {
+            id: dabHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            enabled: parent.btnEnabled
+            onClicked: parent.triggered()
+        }
+    }
+
+    // Segmented-toggle button for the control-center panel's Menu|Updates
+    // switch. Top-level so the ccDetailContent Component can use it.
+    component CcSegButton: Rectangle {
+        id: seg
+        property string segKey: ""
+        property string segIcon: ""
+        property string segLabel: ""
+        property bool active: false
+        signal picked()
+        height: 34
+        radius: Theme.cornerRadius
+        color: active ? Theme.primary : (segHover.containsMouse ? Theme.primaryHoverLight : Theme.surfaceContainerHigh)
+        Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+        Row {
+            anchors.centerIn: parent
+            spacing: Theme.spacingXS
+            DankIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                name: seg.segIcon
+                size: Theme.iconSize - 6
+                color: seg.active ? Theme.surface : Theme.surfaceText
+            }
+            StyledText {
+                anchors.verticalCenter: parent.verticalCenter
+                text: seg.segLabel
+                font.pixelSize: Theme.fontSizeSmall
+                font.weight: seg.active ? Font.Bold : Font.Normal
+                color: seg.active ? Theme.surface : Theme.surfaceText
+            }
+        }
+        MouseArea {
+            id: segHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: seg.picked()
+        }
+    }
+
+    // =====================================================================
+    // Control-center widget. DMS surfaces this in the control center's "add
+    // widget" grid because ccWidgetIcon is non-empty; with ccDetailContent set
+    // it renders as a CompoundPill (icon + status + expand chevron). Expanding
+    // shows a Menu | Updates segmented panel. Status mirrors the bar pill.
+    // =====================================================================
+    ccWidgetIcon: {
+        if (hasFailures) return iconFailures;
+        return updateCount > 0 ? iconUpdates : iconDefault;
+    }
+    ccWidgetPrimaryText: "Shelly Updater"
+    ccWidgetSecondaryText: {
+        if (isChecking) return "Checking for updates…";
+        if (isUpgrading || remoteUpgrading) return "Updating…";
+        if (_externalBusy) return "System update running…";
+        if (hasError) return "Update check failed";
+        if (hasFailures) return failedPackages.length + (failedPackages.length === 1 ? " update failed" : " updates failed");
+        return updateCount === 0 ? "Up to date" : updateCount + (updateCount === 1 ? " update available" : " updates available");
+    }
+    ccWidgetIsActive: updateCount > 0 || hasFailures
+    ccDetailHeight: 360
+    onCcWidgetToggled: {} // body tap: no-op; the expand chevron opens the panel
+
+    ccDetailContent: Component {
+        Rectangle {
+            id: ccPanel
+            radius: Theme.cornerRadius
+            color: Theme.nestedSurface
+            border.color: Theme.outlineMedium
+            border.width: Theme.layerOutlineWidth
+            // Default to the menu (counts + actions); flip to the detailed list.
+            property string ccView: "menu"
+
+            // Pinned failure banner — visible on both tabs so the "something
+            // failed" signal never hides behind the toggle. "Log" opens the
+            // captured session output (works from any surface).
+            Rectangle {
+                id: ccBanner
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Theme.spacingS
+                visible: root.hasFailures
+                height: visible ? 36 : 0
+                radius: Theme.cornerRadius
+                color: Theme.withAlpha(Theme.error, 0.12)
+                border.width: 1
+                border.color: Theme.withAlpha(Theme.error, 0.35)
+                Row {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.spacingS
+                    anchors.right: ccLogBtn.left
+                    anchors.rightMargin: Theme.spacingXS
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.spacingXS
+                    DankIcon { anchors.verticalCenter: parent.verticalCenter; name: "error"; size: Theme.iconSize - 6; color: Theme.error }
+                    StyledText {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.failedPackages.length + (root.failedPackages.length === 1 ? " update failed last run" : " updates failed last run")
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceText
+                        elide: Text.ElideRight
+                    }
+                }
+                Rectangle {
+                    id: ccLogBtn
+                    anchors.right: parent.right
+                    anchors.rightMargin: Theme.spacingXS
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: ccLogRow.implicitWidth + Theme.spacingM
+                    height: 24
+                    radius: Theme.cornerRadius
+                    color: ccLogHover.containsMouse ? Theme.withAlpha(Theme.error, 0.22) : "transparent"
+                    border.width: 1
+                    border.color: Theme.withAlpha(Theme.error, 0.35)
+                    Row {
+                        id: ccLogRow
+                        anchors.centerIn: parent
+                        spacing: 2
+                        DankIcon { anchors.verticalCenter: parent.verticalCenter; name: "description"; size: Theme.iconSize - 8; color: Theme.error }
+                        StyledText { anchors.verticalCenter: parent.verticalCenter; text: "Log"; font.pixelSize: Theme.fontSizeSmall; color: Theme.error }
+                    }
+                    MouseArea { id: ccLogHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.viewLastLog() }
+                }
+            }
+
+            // Segmented toggle + refresh (refresh sits with the toggle so it's
+            // reachable from either tab — the embedded list has no header).
+            Row {
+                id: ccToggle
+                anchors.top: ccBanner.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.leftMargin: Theme.spacingS
+                anchors.rightMargin: Theme.spacingS
+                anchors.topMargin: Theme.spacingS
+                height: 34
+                spacing: Theme.spacingXS
+                // Two segments share the width left after the 34px refresh
+                // button and the two inter-item gaps.
+                readonly property real segWidth: (width - 34 - Theme.spacingXS * 2) / 2
+                CcSegButton {
+                    width: ccToggle.segWidth
+                    segKey: "menu"; segIcon: "menu"; segLabel: "Menu"
+                    active: ccPanel.ccView === "menu"
+                    onPicked: ccPanel.ccView = "menu"
+                }
+                CcSegButton {
+                    width: ccToggle.segWidth
+                    segKey: "updates"; segIcon: "format_list_bulleted"
+                    segLabel: "Updates" + (root.updateCount > 0 ? " (" + root.updateCount + ")" : "")
+                    // Stays active while drilled into a package's detail.
+                    active: ccPanel.ccView !== "menu"
+                    onPicked: ccPanel.ccView = "updates"
+                }
+                Rectangle {
+                    id: ccRefresh
+                    width: 34
+                    height: 34
+                    radius: Theme.cornerRadius
+                    color: ccRefreshHover.containsMouse ? Theme.primaryHoverLight : Theme.surfaceContainerHigh
+                    opacity: root.isChecking ? 0.6 : 1.0
+                    Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+                    DankIcon {
+                        id: ccRefreshIcon
+                        anchors.centerIn: parent
+                        name: "refresh"
+                        size: Theme.iconSize - 6
+                        color: root.isChecking ? Theme.primary : Theme.surfaceText
+                        RotationAnimation on rotation {
+                            from: 0; to: 360; duration: 1000
+                            loops: Animation.Infinite; running: root.isChecking
+                            onRunningChanged: { if (!running) ccRefreshIcon.rotation = 0; }
+                        }
+                    }
+                    MouseArea {
+                        id: ccRefreshHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        enabled: !root.isChecking
+                        onClicked: root.refreshAll()
+                    }
+                }
+            }
+
+            // Content region — fills the rest of the panel; each tab scrolls
+            // within it (no nested outer scroll).
+            Item {
+                id: ccContent
+                anchors.top: ccToggle.bottom
+                anchors.topMargin: Theme.spacingS
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.leftMargin: Theme.spacingS
+                anchors.rightMargin: Theme.spacingS
+                anchors.bottomMargin: Theme.spacingS
+                clip: true
+
+                // Menu tab (scrolls if the actions overflow).
+                Flickable {
+                    anchors.fill: parent
+                    visible: ccPanel.ccView === "menu"
+                    clip: true
+                    contentWidth: width
+                    contentHeight: ccMenu.implicitHeight
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    MenuView {
+                        id: ccMenu
+                        embedded: true
+                        onDismissRequested: PopoutService.closeControlCenter && PopoutService.closeControlCenter()
+                    }
+                }
+
+                // Updates tab (the list fills the region and scrolls itself).
+                // A row click loads that package's detail and drills into the
+                // in-panel detail sub-view.
+                UpdatesView {
+                    visible: ccPanel.ccView === "updates"
+                    embedded: true
+                    embeddedListHeight: ccContent.height
+                    onDismissRequested: PopoutService.closeControlCenter && PopoutService.closeControlCenter()
+                    onRowActivated: item => {
+                        root.loadDetail(item);
+                        ccPanel.ccView = "detail";
+                    }
+                }
+
+                // Detail sub-view (drill-in from the Updates list). Back returns
+                // to the list; update/downgrade close the control center. Body
+                // height fills what's left after the fixed header + action rows.
+                DetailView {
+                    visible: ccPanel.ccView === "detail"
+                    embedded: true
+                    embeddedBodyHeight: Math.max(root.detailRowHeight, ccContent.height - 140)
+                    onBackRequested: ccPanel.ccView = "updates"
+                    onDismissRequested: PopoutService.closeControlCenter && PopoutService.closeControlCenter()
+                }
+            }
+        }
+    }
+
+    // =====================================================================
     // Popout (mode-switching: updates view or menu)
     // =====================================================================
     popoutContent: Component {
@@ -1506,7 +3066,10 @@ PluginComponent {
                 active: root.popoutMode === "updates"
                 visible: active
                 width: parent.width
-                sourceComponent: UpdatesView {}
+                sourceComponent: UpdatesView {
+                    onDismissRequested: popout.closePopout && popout.closePopout()
+                    onRowActivated: item => root.openDetail(item)
+                }
             }
 
             // ---------------- Menu view ----------------
@@ -1514,7 +3077,7 @@ PluginComponent {
                 active: root.popoutMode === "menu"
                 visible: active
                 width: parent.width
-                sourceComponent: MenuView {}
+                sourceComponent: MenuView { onDismissRequested: popout.closePopout && popout.closePopout() }
             }
 
             // ---------------- Package-detail view ----------------
@@ -1522,7 +3085,10 @@ PluginComponent {
                 active: root.popoutMode === "detail"
                 visible: active
                 width: parent.width
-                sourceComponent: DetailView {}
+                sourceComponent: DetailView {
+                    onBackRequested: root.closeDetail()
+                    onDismissRequested: popout.closePopout && popout.closePopout()
+                }
             }
 
             // ---------------- Held-packages manager ----------------
@@ -1549,842 +3115,6 @@ PluginComponent {
                 sourceComponent: FailDetailView {}
             }
 
-            component UpdatesView: Column {
-                id: uv
-                readonly property real contentWidth: width - leftPadding - rightPadding
-                width: parent ? parent.width : 0
-                padding: root.popoutPad
-                spacing: Theme.spacingM
-
-                readonly property var allItems: root.allShownItems()
-                readonly property var failedShown: allItems.filter(function (i) { return root._isFailed(i); })
-
-                // Text filter (matches name/description/version/source).
-                property string filterText: ""
-                readonly property var filteredItems: filterText === ""
-                    ? allItems
-                    : allItems.filter(function (i) { return root._matchesFilter(i, uv.filterText); })
-
-                // Sort: type (pacman→aur→devel→flatpak→appimage) or name.
-                readonly property var displayItems: {
-                    var arr = filteredItems.slice();
-                    var dir = updSort.asc ? 1 : -1;
-                    var key = updSort.activeKey;
-                    arr.sort(function (a, b) {
-                        var c;
-                        if (key === "type") {
-                            c = root._typeRank(a) - root._typeRank(b);
-                            if (c === 0)
-                                c = String(a.name || "").localeCompare(String(b.name || ""));
-                        } else {
-                            c = String(a.name || "").localeCompare(String(b.name || ""));
-                        }
-                        return c * dir;
-                    });
-                    return arr;
-                }
-
-                // Header
-                Item {
-                    width: uv.contentWidth
-                    height: 44
-                    Column {
-                        anchors.left: parent.left
-                        anchors.right: headerActions.left
-                        anchors.rightMargin: Theme.spacingS
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 1
-                        StyledText {
-                            text: "Available Updates"
-                            font.pixelSize: Theme.fontSizeLarge
-                            font.weight: Font.Medium
-                            color: Theme.surfaceText
-                        }
-                        // Subtitle: when the list was last refreshed.
-                        StyledText {
-                            width: parent.width
-                            text: root.lastCheckedText()
-                            visible: text !== ""
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceVariantText
-                            wrapMode: Text.NoWrap
-                            elide: Text.ElideRight
-                        }
-                    }
-                    Row {
-                        id: headerActions
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: Theme.spacingS
-                        StyledText {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: root.isChecking ? "Checking…" : (root.updateCount === 0 ? "Up to date" : root.updateCount + (root.updateCount === 1 ? " update" : " updates"))
-                            font.pixelSize: Theme.fontSizeMedium
-                            color: root.hasError ? Theme.error : Theme.surfaceVariantText
-                        }
-                        DankActionButton {
-                            buttonSize: 28
-                            iconName: "refresh"
-                            iconSize: 18
-                            iconColor: Theme.surfaceText
-                            enabled: !root.isChecking
-                            opacity: enabled ? 1.0 : 0.5
-                            onClicked: root.refreshAll()
-                            RotationAnimation on rotation {
-                                from: 0; to: 360; duration: 1000
-                                loops: Animation.Infinite; running: root.isChecking
-                            }
-                        }
-                    }
-                }
-
-                // Interaction hint — only shown when there are packages that
-                // support the click actions (pacman/AUR rows can be held).
-                Row {
-                    width: uv.contentWidth
-                    spacing: Theme.spacingXS
-                    visible: uv.allItems.length > 0
-                    DankIcon {
-                        anchors.verticalCenter: parent.verticalCenter
-                        name: "info"
-                        size: Theme.fontSizeSmall + 2
-                        color: Theme.surfaceVariantText
-                    }
-                    StyledText {
-                        width: parent.width - (Theme.fontSizeSmall + 2) - Theme.spacingXS
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "Click a package for details · right-click to hold (ignore) it"
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.surfaceVariantText
-                        wrapMode: Text.WordWrap
-                    }
-                }
-
-                // Text filter — search the update list by package name,
-                // description, version or source. Shown only when there is
-                // something to filter.
-                DankTextField {
-                    width: uv.contentWidth
-                    height: 40
-                    visible: uv.allItems.length > 0
-                    leftIconName: "search"
-                    showClearButton: true
-                    placeholderText: "Filter packages…"
-                    text: uv.filterText
-                    onTextEdited: uv.filterText = text
-                }
-
-                // Sort selector (type / name).
-                SortChips {
-                    id: updSort
-                    visible: uv.allItems.length > 0
-                    activeKey: "type"
-                    asc: true
-                    options: [ { key: "type", label: "Type" }, { key: "name", label: "Name" } ]
-                }
-
-                // Failure banner — appears when packages from the last upgrade
-                // are still pending (marked in red below). "View log" opens the
-                // captured session output.
-                Rectangle {
-                    width: uv.contentWidth
-                    visible: uv.failedShown.length > 0
-                    height: visible ? 44 : 0
-                    radius: Theme.cornerRadius
-                    color: Theme.withAlpha(Theme.error, 0.12)
-                    border.width: 1
-                    border.color: Theme.withAlpha(Theme.error, 0.35)
-
-                    Row {
-                        anchors.left: parent.left
-                        anchors.leftMargin: Theme.spacingM
-                        anchors.right: viewLogBtn.left
-                        anchors.rightMargin: Theme.spacingS
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: Theme.spacingS
-                        DankIcon {
-                            anchors.verticalCenter: parent.verticalCenter
-                            name: "error"
-                            size: Theme.iconSize - 4
-                            color: Theme.error
-                        }
-                        StyledText {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Math.max(0, parent.width - (Theme.iconSize - 4) - Theme.spacingS)
-                            text: uv.failedShown.length + (uv.failedShown.length === 1 ? " update didn't apply on the last run" : " updates didn't apply on the last run")
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceText
-                            wrapMode: Text.WordWrap
-                            maximumLineCount: 2
-                            elide: Text.ElideRight
-                        }
-                    }
-                    Rectangle {
-                        id: viewLogBtn
-                        anchors.right: parent.right
-                        anchors.rightMargin: Theme.spacingS
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: viewLogRow.implicitWidth + Theme.spacingM * 2
-                        height: 30
-                        radius: Theme.cornerRadius
-                        color: viewLogHover.containsMouse ? Theme.withAlpha(Theme.error, 0.22) : "transparent"
-                        border.width: 1
-                        border.color: Theme.withAlpha(Theme.error, 0.35)
-                        Row {
-                            id: viewLogRow
-                            anchors.centerIn: parent
-                            spacing: Theme.spacingXS
-                            DankIcon { anchors.verticalCenter: parent.verticalCenter; name: "description"; size: Theme.iconSize - 6; color: Theme.error }
-                            StyledText {
-                                anchors.verticalCenter: parent.verticalCenter
-                                text: "View log"
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.error
-                            }
-                        }
-                        MouseArea {
-                            id: viewLogHover
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: root.viewLastLog()
-                        }
-                    }
-                }
-
-                // List — height follows the configured number of rows.
-                Rectangle {
-                    width: uv.contentWidth
-                    height: Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
-                    radius: Theme.cornerRadius
-                    color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
-
-                    StyledText {
-                        anchors.centerIn: parent
-                        width: parent.width - Theme.spacingL * 2
-                        horizontalAlignment: Text.AlignHCenter
-                        wrapMode: Text.WordWrap
-                        visible: uv.filteredItems.length === 0
-                        text: {
-                            if (uv.allItems.length > 0)
-                                return "No packages match \"" + uv.filterText + "\"";
-                            return root.isChecking ? "Checking for updates…" : (root.hasError ? ("Failed to check for updates:\n" + root.errorMessage) : "Your system is up to date!");
-                        }
-                        color: root.hasError && uv.allItems.length === 0 ? Theme.error : Theme.surfaceText
-                        font.pixelSize: Theme.fontSizeMedium
-                    }
-
-                    DankListView {
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingS
-                        visible: uv.displayItems.length > 0
-                        clip: true
-                        spacing: Theme.spacingXS
-                        model: uv.displayItems
-
-                        delegate: Rectangle {
-                            required property var modelData
-                            // VCS/devel AUR packages (churny "latest-commit" updates) get
-                            // a muted "devel" chip + a dimmed row so they recede visually.
-                            readonly property bool rowIsKernel: root._isKernel(modelData)
-                            readonly property bool rowIsDevel: modelData.source === "aur" && root._isDevelAur(modelData)
-                            // Attempted last run but still pending → didn't apply.
-                            readonly property bool rowIsFailed: root._isFailed(modelData)
-                            width: ListView.view ? ListView.view.width : 0
-                            height: root.detailRowHeight
-                            radius: Theme.cornerRadius
-                            color: itemHover.containsMouse ? Theme.primaryHoverLight : (rowIsFailed ? Theme.withAlpha(Theme.error, 0.09) : "transparent")
-
-                            Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
-
-                            // Left-click the row (anywhere but the download
-                            // button, which sits on top with its own handler)
-                            // opens the extended package-detail view; right-click
-                            // holds it (pacman/AUR only — where ignore applies).
-                            MouseArea {
-                                id: itemHover
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                acceptedButtons: Qt.LeftButton | Qt.RightButton
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: mouse => {
-                                    if (mouse.button === Qt.RightButton) {
-                                        if (modelData.source === "pacman" || modelData.source === "aur")
-                                            root.holdPackage(modelData.name);
-                                    } else {
-                                        root.openDetail(modelData);
-                                    }
-                                }
-                            }
-
-                            Row {
-                                anchors.fill: parent
-                                anchors.margins: Theme.spacingM
-                                spacing: Theme.spacingM
-                                // Failed devel rows stay full-opacity so they stand out.
-                                opacity: (rowIsDevel && !rowIsFailed) ? 0.55 : 1.0
-
-                                Rectangle {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: 52
-                                    height: 20
-                                    radius: Theme.cornerRadius
-                                    color: rowIsFailed ? Theme.withAlpha(Theme.error, 0.22)
-                                        : (rowIsKernel ? Theme.withAlpha(Theme.warning, 0.22) : Theme.secondaryHover)
-                                    StyledText {
-                                        anchors.centerIn: parent
-                                        text: rowIsFailed ? "failed" : (rowIsKernel ? "kernel" : (rowIsDevel ? "devel" : modelData.source))
-                                        font.pixelSize: Theme.fontSizeSmall - 1
-                                        font.weight: (rowIsFailed || rowIsKernel) ? Font.Bold : Font.Normal
-                                        color: rowIsFailed ? Theme.error : (rowIsKernel ? Theme.warning : Theme.surfaceVariantText)
-                                    }
-                                }
-
-                                Column {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: parent.width - 52 - 32 - Theme.spacingM * 3
-                                    spacing: 2
-                                    StyledText {
-                                        width: parent.width
-                                        text: modelData.name
-                                        font.pixelSize: Theme.fontSizeMedium
-                                        font.weight: Font.Medium
-                                        color: Theme.surfaceText
-                                        wrapMode: Text.NoWrap
-                                        maximumLineCount: 1
-                                        elide: Text.ElideRight
-                                    }
-                                    StyledText {
-                                        width: parent.width
-                                        text: {
-                                            var v = (modelData.oldVersion || "?") + " → " + (modelData.newVersion || "?");
-                                            var ds = Number(modelData.downloadSize) || 0;
-                                            if (ds > 0)
-                                                v += "  ·  " + root._fmtBytes(ds);
-                                            return v;
-                                        }
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.primary
-                                        wrapMode: Text.NoWrap
-                                        maximumLineCount: 1
-                                        elide: Text.ElideRight
-                                    }
-                                    StyledText {
-                                        width: parent.width
-                                        text: modelData.description
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                        wrapMode: Text.NoWrap
-                                        maximumLineCount: 1
-                                        elide: Text.ElideRight
-                                        visible: modelData.description !== ""
-                                    }
-                                }
-
-                                DankActionButton {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    buttonSize: 30
-                                    iconName: "download"
-                                    iconSize: 18
-                                    iconColor: Theme.primary
-                                    enabled: !root.isUpgrading
-                                    onClicked: {
-                                        root.updateOne(modelData);
-                                        popout.closePopout && popout.closePopout();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Update All button
-                Rectangle {
-                    width: uv.contentWidth
-                    height: 48
-                    radius: Theme.cornerRadius
-                    color: updateAllHover.containsMouse ? Theme.primaryHover : Theme.secondaryHover
-                    opacity: root.updateCount > 0 && !root.isUpgrading ? 1.0 : 0.5
-                    Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-                        DankIcon { name: "download"; size: Theme.iconSize; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
-                        StyledText {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: "Update All"
-                            font.pixelSize: Theme.fontSizeMedium
-                            font.weight: Font.Medium
-                            color: Theme.primary
-                        }
-                    }
-                    MouseArea {
-                        id: updateAllHover
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: root.updateCount > 0 && !root.isUpgrading
-                        onClicked: {
-                            root.updateAll();
-                            popout.closePopout && popout.closePopout();
-                        }
-                    }
-                }
-            }
-
-            component DetailView: Column {
-                id: dv
-                readonly property real contentWidth: width - leftPadding - rightPadding
-                width: parent ? parent.width : 0
-                padding: root.popoutPad
-                spacing: Theme.spacingM
-
-                readonly property var detail: root.detailData
-                readonly property var pkg: root.detailItem
-                readonly property bool rowIsKernel: pkg ? root._isKernel(pkg) : false
-
-                // Header: back button + package name + source chip
-                Item {
-                    width: dv.contentWidth
-                    height: 40
-                    DankActionButton {
-                        id: backBtn
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        buttonSize: 28
-                        iconName: "arrow_back"
-                        iconSize: 18
-                        iconColor: Theme.surfaceText
-                        onClicked: root.closeDetail()
-                    }
-                    StyledText {
-                        anchors.left: backBtn.right
-                        anchors.leftMargin: Theme.spacingS
-                        anchors.right: srcChip.left
-                        anchors.rightMargin: Theme.spacingS
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: dv.pkg ? dv.pkg.name : ""
-                        font.pixelSize: Theme.fontSizeLarge
-                        font.weight: Font.Medium
-                        color: Theme.surfaceText
-                        elide: Text.ElideRight
-                    }
-                    Rectangle {
-                        id: srcChip
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: 56
-                        height: 20
-                        radius: Theme.cornerRadius
-                        color: dv.rowIsKernel ? Theme.withAlpha(Theme.warning, 0.22) : Theme.secondaryHover
-                        StyledText {
-                            anchors.centerIn: parent
-                            text: dv.rowIsKernel ? "kernel" : (dv.pkg ? dv.pkg.source : "")
-                            font.pixelSize: Theme.fontSizeSmall - 1
-                            font.weight: dv.rowIsKernel ? Font.Bold : Font.Normal
-                            color: dv.rowIsKernel ? Theme.warning : Theme.surfaceVariantText
-                        }
-                    }
-                }
-
-                // Body: scrollable field list (bounded so the popout height
-                // stays comparable to the other modes).
-                Rectangle {
-                    width: dv.contentWidth
-                    height: Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
-                    radius: Theme.cornerRadius
-                    color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
-
-                    // Loading / error placeholder
-                    Column {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-                        width: parent.width - Theme.spacingL * 2
-                        visible: root.detailLoading || root.detailError !== ""
-                        DankIcon {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            name: root.detailError !== "" ? "error" : "hourglass_top"
-                            size: Theme.iconSize
-                            color: root.detailError !== "" ? Theme.error : Theme.surfaceVariantText
-                            RotationAnimation on rotation {
-                                from: 0; to: 360; duration: 1000
-                                loops: Animation.Infinite; running: root.detailLoading
-                            }
-                        }
-                        StyledText {
-                            width: parent.width
-                            horizontalAlignment: Text.AlignHCenter
-                            wrapMode: Text.WordWrap
-                            text: root.detailError !== "" ? root.detailError : "Loading details…"
-                            color: root.detailError !== "" ? Theme.error : Theme.surfaceText
-                            font.pixelSize: Theme.fontSizeMedium
-                        }
-                    }
-
-                    Flickable {
-                        id: fieldFlick
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingM
-                        clip: true
-                        visible: !root.detailLoading && root.detailError === "" && dv.detail !== null
-                        contentHeight: fieldCol.height
-                        contentWidth: width
-                        boundsBehavior: Flickable.StopAtBounds
-                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-
-                        Column {
-                            id: fieldCol
-                            width: fieldFlick.width
-                            spacing: Theme.spacingS
-
-                            // Full-width description
-                            StyledText {
-                                width: parent.width
-                                visible: dv.detail && dv.detail.description !== ""
-                                text: dv.detail ? dv.detail.description : ""
-                                font.pixelSize: Theme.fontSizeMedium
-                                color: Theme.surfaceText
-                                wrapMode: Text.WordWrap
-                            }
-
-                            Rectangle {
-                                width: parent.width
-                                height: 1
-                                color: Theme.outline
-                                opacity: 0.25
-                                visible: dv.detail && dv.detail.description !== "" && dv.detail.fields.length > 0
-                            }
-
-                            // Label / value rows
-                            Repeater {
-                                model: dv.detail ? dv.detail.fields : []
-                                delegate: Row {
-                                    required property var modelData
-                                    width: fieldCol.width
-                                    spacing: Theme.spacingM
-                                    StyledText {
-                                        width: 104
-                                        text: modelData.label
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: Theme.surfaceVariantText
-                                        wrapMode: Text.WordWrap
-                                    }
-                                    StyledText {
-                                        width: parent.width - 104 - Theme.spacingM
-                                        text: modelData.value
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        font.family: modelData.mono ? Theme.monoFontFamily : Theme.fontFamily
-                                        // Link fields render as an underlined,
-                                        // primary-colored, clickable URL that
-                                        // opens in the default browser.
-                                        font.underline: modelData.link === true
-                                        color: modelData.link === true ? Theme.primary : Theme.surfaceText
-                                        wrapMode: Text.WrapAnywhere
-
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            enabled: modelData.link === true
-                                            hoverEnabled: enabled
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: Qt.openUrlExternally(modelData.value)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Update this package
-                Rectangle {
-                    width: dv.contentWidth
-                    height: 48
-                    radius: Theme.cornerRadius
-                    color: detailUpdateHover.containsMouse ? Theme.primaryHover : Theme.secondaryHover
-                    opacity: !root.isUpgrading ? 1.0 : 0.5
-                    Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
-
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-                        DankIcon { name: "download"; size: Theme.iconSize; color: Theme.primary; anchors.verticalCenter: parent.verticalCenter }
-                        StyledText {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: "Update This Package"
-                            font.pixelSize: Theme.fontSizeMedium
-                            font.weight: Font.Medium
-                            color: Theme.primary
-                        }
-                    }
-                    MouseArea {
-                        id: detailUpdateHover
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        enabled: !root.isUpgrading
-                        onClicked: {
-                            root.updateOne(dv.pkg);
-                            popout.closePopout && popout.closePopout();
-                        }
-                    }
-                }
-
-                // Secondary actions: hold/unhold + downgrade.
-                Row {
-                    width: dv.contentWidth
-                    spacing: Theme.spacingS
-                    readonly property bool isHeld: dv.pkg ? root._isHeld(dv.pkg.name) : false
-                    // ignore/downgrade apply to pacman/AUR, not flatpak/appimage.
-                    readonly property bool canHold: dv.pkg && (dv.pkg.source === "pacman" || dv.pkg.source === "aur")
-                    readonly property bool canDowngrade: canHold
-
-                    DetailActionButton {
-                        visible: parent.canHold
-                        width: parent.canDowngrade ? (parent.width - Theme.spacingS) / 2 : parent.width
-                        icon: parent.isHeld ? "check_circle" : "block"
-                        label: parent.isHeld ? "Unhold" : "Hold"
-                        onTriggered: {
-                            if (parent.isHeld)
-                                root.unholdPackage(dv.pkg.name);
-                            else
-                                root.holdPackage(dv.pkg.name);
-                            root.closeDetail();
-                        }
-                    }
-                    DetailActionButton {
-                        visible: parent.canDowngrade
-                        width: parent.canHold ? (parent.width - Theme.spacingS) / 2 : parent.width
-                        icon: "history"
-                        label: "Downgrade"
-                        btnEnabled: !root.isUpgrading
-                        onTriggered: {
-                            root.downgradeOne(dv.pkg);
-                            popout.closePopout && popout.closePopout();
-                        }
-                    }
-                }
-            }
-
-            // Small secondary button used in the detail view's action row.
-            component DetailActionButton: Rectangle {
-                property string icon: ""
-                property string label: ""
-                property bool btnEnabled: true
-                signal triggered
-                height: 40
-                radius: Theme.cornerRadius
-                color: dabHover.containsMouse ? Theme.primaryHoverLight : Theme.secondaryHover
-                opacity: btnEnabled ? 1.0 : 0.5
-                Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
-                Row {
-                    anchors.centerIn: parent
-                    spacing: Theme.spacingXS
-                    DankIcon { name: icon; size: Theme.iconSize - 2; color: Theme.surfaceText; anchors.verticalCenter: parent.verticalCenter }
-                    StyledText {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: label
-                        font.pixelSize: Theme.fontSizeMedium
-                        color: Theme.surfaceText
-                    }
-                }
-                MouseArea {
-                    id: dabHover
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    enabled: parent.btnEnabled
-                    onClicked: parent.triggered()
-                }
-            }
-
-            // Inline "Sort by …" selector: a label + one chip per option. The
-            // active chip shows a direction arrow; clicking it flips asc/desc,
-            // clicking another switches the key. Owns activeKey/asc (the view
-            // reads them by id).
-            component SortChips: Row {
-                id: sc
-                property var options: []          // [{ key, label }]
-                property string activeKey: ""
-                property bool asc: true
-                spacing: Theme.spacingXS
-
-                StyledText {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "Sort"
-                    font.pixelSize: Theme.fontSizeSmall
-                    color: Theme.surfaceVariantText
-                }
-                Repeater {
-                    model: sc.options
-                    delegate: Rectangle {
-                        required property var modelData
-                        readonly property bool active: modelData.key === sc.activeKey
-                        anchors.verticalCenter: parent.verticalCenter
-                        height: 24
-                        width: chipRow.implicitWidth + Theme.spacingS * 2
-                        radius: Theme.cornerRadius
-                        color: active ? Theme.primaryHoverLight : (chHover.containsMouse ? Theme.secondaryHover : "transparent")
-                        border.width: active ? 0 : 1
-                        border.color: Theme.outlineMedium
-                        Row {
-                            id: chipRow
-                            anchors.centerIn: parent
-                            spacing: 2
-                            StyledText {
-                                anchors.verticalCenter: parent.verticalCenter
-                                text: modelData.label
-                                font.pixelSize: Theme.fontSizeSmall
-                                font.weight: active ? Font.Medium : Font.Normal
-                                color: active ? Theme.primary : Theme.surfaceVariantText
-                            }
-                            DankIcon {
-                                anchors.verticalCenter: parent.verticalCenter
-                                visible: active
-                                name: sc.asc ? "arrow_upward" : "arrow_downward"
-                                size: Theme.fontSizeSmall
-                                color: Theme.primary
-                            }
-                        }
-                        MouseArea {
-                            id: chHover
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: {
-                                if (sc.activeKey === modelData.key)
-                                    sc.asc = !sc.asc;
-                                else
-                                    sc.activeKey = modelData.key;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // A single on/off filter chip (e.g. "Failed only").
-            component FilterChip: Rectangle {
-                id: fc
-                property string label: ""
-                property string icon: ""
-                property bool active: false
-                property color activeColor: Theme.primary
-                signal toggled
-                height: 24
-                width: fcRow.implicitWidth + Theme.spacingS * 2
-                radius: Theme.cornerRadius
-                color: active ? Theme.withAlpha(activeColor, 0.18) : (fcHover.containsMouse ? Theme.secondaryHover : "transparent")
-                border.width: active ? 0 : 1
-                border.color: Theme.outlineMedium
-                Row {
-                    id: fcRow
-                    anchors.centerIn: parent
-                    spacing: 3
-                    DankIcon {
-                        anchors.verticalCenter: parent.verticalCenter
-                        visible: fc.icon !== ""
-                        name: fc.icon
-                        size: Theme.fontSizeSmall
-                        color: fc.active ? fc.activeColor : Theme.surfaceVariantText
-                    }
-                    StyledText {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: fc.label
-                        font.pixelSize: Theme.fontSizeSmall
-                        font.weight: fc.active ? Font.Medium : Font.Normal
-                        color: fc.active ? fc.activeColor : Theme.surfaceVariantText
-                    }
-                }
-                MouseArea {
-                    id: fcHover
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: fc.toggled()
-                }
-            }
-
-            component MenuView: Column {
-                id: mv
-                readonly property real contentWidth: width - leftPadding - rightPadding
-                width: parent ? parent.width : 0
-                padding: root.popoutPad
-                spacing: Theme.spacingXS
-
-                Item { width: mv.contentWidth; height: 32
-                    StyledText {
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "Shelly Updater"
-                        font.pixelSize: Theme.fontSizeLarge
-                        font.weight: Font.Medium
-                        color: Theme.surfaceText
-                    }
-                }
-
-                MenuItem {
-                    itemIcon: "download"; itemLabel: "Update All"
-                    badge: root.updateCount > 0 ? String(root.updateCount) : ""
-                    onTriggered: { root.updateAll(); popout.closePopout && popout.closePopout(); }
-                }
-                MenuItem {
-                    itemIcon: "terminal"; itemLabel: "Update System Packages (Pacman)"
-                    badge: root.pacmanUpdatesShown.length > 0 ? String(root.pacmanUpdatesShown.length) : ""
-                    onTriggered: { root.updatePacman(); popout.closePopout && popout.closePopout(); }
-                }
-                MenuItem {
-                    visible: root.enableAur; height: visible ? 44 : 0
-                    itemIcon: "deployed_code"; itemLabel: "Update AUR"
-                    badge: root.aurUpdatesShown.length > 0 ? String(root.aurUpdatesShown.length) : ""
-                    onTriggered: { root.updateAur(); popout.closePopout && popout.closePopout(); }
-                }
-                MenuItem {
-                    visible: root.enableFlatpak; height: visible ? 44 : 0
-                    itemIcon: "package_2"; itemLabel: "Update Flatpak"
-                    badge: root.flatpakUpdates.length > 0 ? String(root.flatpakUpdates.length) : ""
-                    onTriggered: { root.updateFlatpak(); popout.closePopout && popout.closePopout(); }
-                }
-                MenuItem {
-                    visible: root.enableAppimage; height: visible ? 44 : 0
-                    itemIcon: "widgets"; itemLabel: "Update AppImage"
-                    badge: root.appimageUpdates.length > 0 ? String(root.appimageUpdates.length) : ""
-                    onTriggered: { root.updateAppimage(); popout.closePopout && popout.closePopout(); }
-                }
-
-                Rectangle { width: mv.contentWidth; height: 1; color: Theme.outline; opacity: 0.3 }
-
-                MenuItem {
-                    itemIcon: "history"; itemLabel: "Update History…"
-                    onTriggered: root.openHistory()
-                }
-                MenuItem {
-                    itemIcon: "block"; itemLabel: "Held Packages…"
-                    badge: root.ignoredPackages.length > 0 ? String(root.ignoredPackages.length) : ""
-                    onTriggered: root.openHeld()
-                }
-                MenuItem {
-                    itemIcon: "cleaning_services"; itemLabel: "Clean Package Cache"
-                    onTriggered: { root.cleanCache(); popout.closePopout && popout.closePopout(); }
-                }
-                MenuItem {
-                    itemIcon: "delete_sweep"; itemLabel: "Remove Orphans"
-                    onTriggered: { root.removeOrphans(); popout.closePopout && popout.closePopout(); }
-                }
-
-                Rectangle { width: mv.contentWidth; height: 1; color: Theme.outline; opacity: 0.3 }
-
-                MenuItem {
-                    visible: root.showOpenShellyMenuItem; height: visible ? 44 : 0
-                    itemIcon: "open_in_new"; itemLabel: "Open Shelly UI"
-                    onTriggered: { root.openShellyUi(); popout.closePopout && popout.closePopout(); }
-                }
-                MenuItem {
-                    itemIcon: "settings"; itemLabel: "Settings"
-                    onTriggered: { root.openPluginSettings(); popout.closePopout && popout.closePopout(); }
-                }
-            }
-
-            // ---------------- Held-packages manager ----------------
             component HeldView: Column {
                 id: hv
                 readonly property real contentWidth: width - leftPadding - rightPadding
@@ -2771,6 +3501,10 @@ PluginComponent {
                     if (hasVersions)
                         f.push({ label: "Attempted", value: (entry.oldVersion || "?") + "  →  " + (entry.newVersion || "?"), err: false });
                     f.push({ label: "When", value: root._fmtHistoryWhen(entry.when || ""), err: false });
+                    if (entry.reason === root.reasonPkgbuildDiff)
+                        f.push({ label: "Fix", value: "The package's PKGBUILD changed, so Shelly refused to build it non-interactively. Run \"shelly aur update " + (entry.name || "<pkg>") + "\" in a terminal, review the diff, and accept it — updates from here will work again afterwards.", err: false });
+                    if (entry.reason === root.reasonDepConflict)
+                        f.push({ label: "Fix", value: "An upgrade needs a newer shared library (soname) than a held or AUR package provides — held packages aren't upgraded but still block resolution, so the whole transaction is refused. This usually means a package group must be rebuilt together against the new library (e.g. the hypr* -git stack after a libhyprutils soname bump): rebuild the whole group in one go, then run the update again. See the \"breaks dependency …\" lines in the log below for the exact library and packages involved.", err: false });
                     return f;
                 }
 
@@ -2841,6 +3575,96 @@ PluginComponent {
                                 color: modelData.err ? Theme.error : Theme.surfaceText
                                 wrapMode: Text.WrapAnywhere
                             }
+                        }
+                    }
+                }
+
+                // ---- AI failure analysis ----
+                readonly property string aiText: (entry && entry.ai) ? entry.ai : ""
+
+                DetailActionButton {
+                    width: fdv.contentWidth
+                    visible: root.aiReady && fdv.aiText === "" && !root.aiLoading
+                    icon: "neurology"
+                    label: "Suggest fix with AI"
+                    onTriggered: root.requestAiSuggestion()
+                }
+                // In-flight indicator (click to cancel).
+                Rectangle {
+                    width: fdv.contentWidth
+                    visible: root.aiLoading
+                    height: visible ? 40 : 0
+                    radius: Theme.cornerRadius
+                    color: Theme.secondaryHover
+                    Row {
+                        anchors.centerIn: parent
+                        spacing: Theme.spacingS
+                        DankIcon {
+                            id: aiSpinner
+                            anchors.verticalCenter: parent.verticalCenter
+                            name: "progress_activity"
+                            size: Theme.iconSize - 2
+                            color: Theme.primary
+                            RotationAnimation on rotation {
+                                from: 0; to: 360; duration: 1000
+                                loops: Animation.Infinite; running: root.aiLoading
+                                onRunningChanged: { if (!running) aiSpinner.rotation = 0; }
+                            }
+                        }
+                        StyledText {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Asking the AI… (click to cancel)"
+                            font.pixelSize: Theme.fontSizeMedium
+                            color: Theme.surfaceText
+                        }
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.cancelAiSuggestion()
+                    }
+                }
+                StyledText {
+                    width: fdv.contentWidth
+                    visible: root.aiError !== "" && !root.aiLoading
+                    text: root.aiError
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.error
+                    wrapMode: Text.WordWrap
+                }
+                StyledText {
+                    width: fdv.contentWidth
+                    visible: fdv.aiText !== ""
+                    text: "AI suggestion"
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: Theme.surfaceVariantText
+                }
+                Rectangle {
+                    width: fdv.contentWidth
+                    visible: fdv.aiText !== ""
+                    height: visible ? Math.min(aiAnswer.implicitHeight + Theme.spacingM * 2,
+                                               Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS))) : 0
+                    radius: Theme.cornerRadius
+                    color: Theme.withAlpha(Theme.primary, 0.08)
+                    border.width: 1
+                    border.color: Theme.withAlpha(Theme.primary, 0.25)
+
+                    Flickable {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        clip: true
+                        contentHeight: aiAnswer.implicitHeight
+                        contentWidth: width
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                        StyledText {
+                            id: aiAnswer
+                            width: parent.width
+                            text: fdv.aiText
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceText
+                            wrapMode: Text.WordWrap
                         }
                     }
                 }

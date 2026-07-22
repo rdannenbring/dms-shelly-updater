@@ -9,7 +9,7 @@
     "type": "widget",
     "component": "./ShellyUpdater.qml",
     "settings": "./ShellyUpdaterSettings.qml",
-    "capabilities": ["dankbar-widget"],
+    "capabilities": ["dankbar-widget", "control-center-widget"],
     "requires_dms": ">=1.4.0",
     "permissions": [
         "process",

@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import qs.Common
 import qs.Modules.Plugins
@@ -19,15 +20,36 @@ PluginSettings {
     property bool notifyEnabled: false
     property bool detectEnabled: true
     property bool limitEnabled: false
+    property bool aiEnabled: false
     function refreshDependents() {
         tooltipEnabled = loadValue("showTooltip", false);
         aurEnabled = loadValue("enableAur", true);
         notifyEnabled = loadValue("notifyOnUpdates", false);
         detectEnabled = loadValue("detectFailedUpdates", true);
         limitEnabled = loadValue("limitBuildResources", false);
+        aiEnabled = loadValue("aiEnabled", false);
     }
-    Component.onCompleted: refreshDependents()
+    Component.onCompleted: Qt.callLater(refreshDependents)
     onSettingChanged: refreshDependents()
+    // pluginService (and plugin data) can be assigned AFTER Component.onCompleted
+    // when the settings panel is reopened. The base PluginSettings reloads each
+    // child widget's value on these signals — but not our dependent flags, so
+    // without this the sub-settings stay hidden until the toggle is flipped
+    // (their loadValue() returned the default at onCompleted time). Separate
+    // Connections objects stack with the base's inline handlers rather than
+    // replacing them.
+    Connections {
+        target: root
+        function onPluginServiceChanged() { root.refreshDependents(); }
+    }
+    Connections {
+        target: root.pluginService
+        enabled: root.pluginService !== null
+        function onPluginDataChanged(changedPluginId) {
+            if (changedPluginId === root.pluginId)
+                root.refreshDependents();
+        }
+    }
 
     // ---- Reusable helpers ----------------------------------------------
     component SectionHeader: Column {
@@ -333,7 +355,8 @@ PluginSettings {
                 { text: "Sources", icon: "inventory_2" },
                 { text: "Look", icon: "palette" },
                 { text: "Actions", icon: "ads_click" },
-                { text: "Updates", icon: "terminal" }
+                { text: "Updates", icon: "terminal" },
+                { text: "AI", icon: "neurology" }
             ]
 
             Component.onCompleted: Qt.callLater(updateIndicator)
@@ -476,6 +499,17 @@ PluginSettings {
             maximum: 25
             unit: ""
         }
+
+        SectionHeader {
+            title: "Failures"
+            subtitle: "Failed updates can slip by silently — the terminal closes and the run may even report success (e.g. an AUR build cancelled because its PKGBUILD changed)."
+        }
+        ToggleSetting {
+            settingKey: "notifyOnFailures"
+            label: "Notify when an update fails"
+            description: "Send a notification when packages from an update run didn't apply. The notification carries a \"View details\" action (and \"Explain with AI\" when AI analysis is configured in the AI tab)."
+            defaultValue: true
+        }
     }
 
     // ==== Tab 3: Sources ================================================
@@ -521,6 +555,13 @@ PluginSettings {
             description: "Material Symbol shown when updates are available."
             defaultValue: "system_update_alt"
             suggestions: ["system_update_alt", "download", "file_download", "cloud_download", "upgrade", "new_releases"]
+        }
+        IconSetting {
+            settingKey: "iconFailures"
+            label: "Icon — last update failed"
+            description: "Material Symbol shown when packages from the last update run didn't apply. A distinct glyph (not just a color) so it stays visible with bar themes that mute icon colors."
+            defaultValue: "release_alert"
+            suggestions: ["release_alert", "warning", "running_with_errors", "sync_problem", "report", "priority_high"]
         }
         ToggleSetting {
             settingKey: "showCount"
@@ -667,6 +708,12 @@ PluginSettings {
             defaultValue: false
         }
         ToggleSetting {
+            settingKey: "surviveRestart"
+            label: "Keep terminal alive across DMS restarts"
+            description: "Launch the update terminal in its own systemd scope so it survives a DMS crash or restart (the update keeps running in its own window). Opens the update in a standalone window rather than a tab of your existing terminal. Requires systemd (uses systemd-run)."
+            defaultValue: true
+        }
+        ToggleSetting {
             settingKey: "detectFailedUpdates"
             label: "Detect failed updates"
             description: "After an update, flag any package that still shows a pending update (it didn't apply) with a red \"failed\" marker in the updates view, plus a \"View log\" button. This records the update session with 'script' to keep a log — turn off to run updates without that wrapper."
@@ -718,6 +765,196 @@ PluginSettings {
                 { label: "12 jobs", value: "12" },
                 { label: "16 jobs", value: "16" }
             ]
+        }
+    }
+
+    // ==== Tab 7: AI (failure analysis) ==================================
+    Column {
+        visible: root.currentTab === 7
+        width: parent.width
+        spacing: Theme.spacingM
+
+        SectionHeader {
+            title: "AI Failure Analysis"
+            subtitle: "When an update fails, ask an AI to read the captured log and suggest fixes — via a command-line tool YOU configure. The plugin never talks to an AI service directly and never stores API keys; a subscription-based CLI (like Claude Code) works without paying for API credits."
+        }
+        ToggleSetting {
+            settingKey: "aiEnabled"
+            label: "Enable AI suggestions"
+            description: "Adds a \"Suggest fix with AI\" button to the failure-detail view and an \"Explain with AI\" action to failure notifications."
+            defaultValue: false
+        }
+        StringSetting {
+            visible: root.aiEnabled
+            height: visible ? implicitHeight : 0
+            settingKey: "aiCommand"
+            label: "AI command"
+            description: "A shell command that reads a prompt on standard input and prints a plain-text answer on standard output. Runs with your desktop session's environment, so tools on your normal PATH work."
+            placeholder: "claude -p"
+            defaultValue: ""
+        }
+        Rectangle {
+            visible: root.aiEnabled
+            width: parent.width
+            height: visible ? aiExamplesCol.implicitHeight + Theme.spacingL * 2 : 0
+            radius: Theme.cornerRadius
+            color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.15)
+            border.width: 1
+            border.color: Theme.outlineLight
+            Column {
+                id: aiExamplesCol
+                anchors.fill: parent
+                anchors.margins: Theme.spacingL
+                spacing: Theme.spacingS
+
+                StyledText { text: "Examples:"; font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Medium; color: Theme.surfaceText }
+                StyledText { text: "Claude Code (uses your Claude subscription):"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                CopyableCommand { command: "claude -p" }
+                StyledText { text: "OpenCode (uses whatever provider it's configured with):"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                CopyableCommand { command: "opencode run" }
+                StyledText { text: "A local model via Ollama (fully offline):"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                CopyableCommand { command: "ollama run llama3.2" }
+                StyledText { text: "Gemini CLI:"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceVariantText }
+                CopyableCommand { command: "gemini -p" }
+            }
+        }
+        StyledText {
+            visible: root.aiEnabled
+            width: parent.width
+            text: "Privacy note: the prompt sent to the command contains the failed package's name, versions, the failure reason, and the saved tail of the update log (which can include hostnames and package lists). Nothing is sent automatically — analysis only runs when you click the button or the notification action."
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+        }
+
+        SectionHeader {
+            visible: root.aiEnabled
+            title: "Prompt"
+            subtitle: "The exact prompt sent to your AI command. Placeholders are filled in per failure: {package}, {source}, {oldVersion}, {newVersion}, {reason}, {log}, and {environment} (auto-detected distro, kernel, architecture and Shelly version). Clearing the text restores the default."
+        }
+        Column {
+            id: promptEditor
+            visible: root.aiEnabled
+            width: parent.width
+            height: visible ? implicitHeight : 0
+            spacing: Theme.spacingS
+
+            // KEEP IN SYNC with aiPromptDefault in ShellyUpdater.qml.
+            readonly property string defaultTemplate: [
+                "You are helping diagnose a failed package update on a Linux system.",
+                "The update was run through the Shelly package manager (wraps pacman/AUR/Flatpak/AppImage).",
+                "",
+                "System environment:",
+                "{environment}",
+                "",
+                "Package: {package} (source: {source})",
+                "Attempted: {oldVersion} -> {newVersion}",
+                "Failure reason (updater's classification): {reason}",
+                "",
+                "Tail of the captured update log:",
+                "{log}",
+                "",
+                "Briefly explain what went wrong, then give concrete numbered fix steps the user can run.",
+                "Plain text only — no markdown syntax. Keep it under 200 words."
+            ].join("\n")
+            property bool isInitialized: false
+
+            function findSettings() {
+                var item = parent;
+                while (item) {
+                    if (item.saveValue !== undefined && item.loadValue !== undefined)
+                        return item;
+                    item = item.parent;
+                }
+                return null;
+            }
+            function loadTemplate() {
+                var s = findSettings();
+                if (s && s.pluginService) {
+                    var saved = s.loadValue("aiPromptTemplate", "");
+                    promptArea.text = saved !== "" ? saved : defaultTemplate;
+                    isInitialized = true;
+                }
+            }
+            // Store "" when the text matches the default (or is blank) so the
+            // widget keeps tracking future default improvements.
+            function commit() {
+                if (!isInitialized)
+                    return;
+                var s = findSettings();
+                if (!s)
+                    return;
+                var t = promptArea.text;
+                var v = (t.trim() === "" || t.trim() === defaultTemplate.trim()) ? "" : t;
+                s.saveValue("aiPromptTemplate", v);
+                if (t.trim() === "")
+                    promptArea.text = defaultTemplate;
+            }
+            Component.onCompleted: Qt.callLater(loadTemplate)
+
+            Row {
+                width: parent.width
+                spacing: Theme.spacingS
+                StyledText {
+                    width: parent.width - promptResetBtn.width - Theme.spacingS
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: promptArea.text.trim() !== promptEditor.defaultTemplate.trim() ? "Custom prompt" : "Default prompt"
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                }
+                DankActionButton {
+                    id: promptResetBtn
+                    anchors.verticalCenter: parent.verticalCenter
+                    buttonSize: 26
+                    iconName: "restart_alt"
+                    iconSize: 16
+                    iconColor: Theme.surfaceVariantText
+                    tooltipText: "Reset to the default prompt"
+                    visible: promptArea.text.trim() !== promptEditor.defaultTemplate.trim()
+                    onClicked: {
+                        promptArea.text = promptEditor.defaultTemplate;
+                        promptEditor.commit();
+                    }
+                }
+            }
+            Rectangle {
+                width: parent.width
+                height: 240
+                radius: Theme.cornerRadius
+                color: Theme.surfaceContainerHighest
+                border.width: promptArea.activeFocus ? 2 : 1
+                border.color: promptArea.activeFocus ? Theme.primary : Theme.outlineLight
+
+                Flickable {
+                    id: promptFlick
+                    anchors.fill: parent
+                    anchors.margins: Theme.spacingS
+                    clip: true
+                    contentWidth: width
+                    contentHeight: promptArea.implicitHeight
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                    TextArea.flickable: TextArea {
+                        id: promptArea
+                        width: promptFlick.width
+                        wrapMode: TextArea.Wrap
+                        textFormat: TextEdit.PlainText
+                        font.family: "monospace"
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceText
+                        selectionColor: Theme.primary
+                        selectedTextColor: Theme.surface
+                        background: null
+                        // Persist on focus loss, not per keystroke — saveValue
+                        // broadcasts plugin state to every widget instance.
+                        onActiveFocusChanged: {
+                            if (!activeFocus)
+                                promptEditor.commit();
+                        }
+                    }
+                }
+            }
         }
     }
 }
