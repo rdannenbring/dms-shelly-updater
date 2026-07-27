@@ -855,6 +855,7 @@ PluginSettings {
                 "{log}",
                 "",
                 "Briefly explain what went wrong, then give concrete numbered fix steps the user can run.",
+                "Put each runnable shell command on its own line, prefixed with \"$ \" (dollar + space) and nothing else on that line, so it can be copied and run directly.",
                 "Plain text only — no markdown syntax. Keep it under 200 words."
             ].join("\n")
             property bool isInitialized: false

@@ -13,54 +13,87 @@ PluginComponent {
 
     readonly property string pluginName: "shellyUpdater"
 
+    // Effective settings source. The control-center widget is a separate plugin
+    // instance whose pluginService is often not wired, so the base
+    // loadPluginData() leaves pluginData empty and every setting falls back to
+    // its default (e.g. the "Suggest fix with AI" button stays hidden because
+    // aiEnabled reads false). When pluginData is empty we read the on-disk
+    // plugin_settings.json directly (values there are plain, not double-encoded).
+    property var _pdFallback: ({})
+    readonly property var _pd: (pluginData && Object.keys(pluginData).length > 0) ? pluginData : _pdFallback
+    readonly property string _pluginSettingsPath: (Quickshell.env("XDG_CONFIG_HOME")
+        || (Quickshell.env("HOME") + "/.config"))
+        + "/DankMaterialShell/plugin_settings.json"
+    function _ensureSettings() {
+        if (pluginData && Object.keys(pluginData).length > 0)
+            return; // base already loaded them
+        pluginSettingsProc.running = true;
+    }
+    Process {
+        id: pluginSettingsProc
+        command: ["cat", root._pluginSettingsPath]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    var all = JSON.parse(text || "{}");
+                    // Index by the known plugin name, NOT root.pluginId — the
+                    // control-center instance can carry a different/blank pluginId.
+                    if (all && all[root.pluginName])
+                        root._pdFallback = all[root.pluginName];
+                } catch (e) {}
+            }
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+    }
+
     // ---- Settings (bound to pluginData so they react to changes) ----
-    readonly property bool autoCheck: pluginData.autoCheck !== undefined ? pluginData.autoCheck : true
-    readonly property int checkFrequency: parseInt(pluginData.checkFrequency || "60") // minutes
-    readonly property bool checkAtStartup: pluginData.checkAtStartup !== undefined ? pluginData.checkAtStartup : true
-    readonly property bool confirmations: pluginData.confirmations !== undefined ? pluginData.confirmations : true
-    readonly property bool enableAur: pluginData.enableAur !== undefined ? pluginData.enableAur : true
-    readonly property bool enableFlatpak: pluginData.enableFlatpak !== undefined ? pluginData.enableFlatpak : true
-    readonly property bool enableAppimage: pluginData.enableAppimage !== undefined ? pluginData.enableAppimage : false
-    readonly property bool excludeDevelAur: pluginData.excludeDevelAur !== undefined ? pluginData.excludeDevelAur : false
-    readonly property bool alwaysConfirmKernel: pluginData.alwaysConfirmKernel !== undefined ? pluginData.alwaysConfirmKernel : false
-    readonly property string iconDefault: pluginData.iconDefault || "check_circle"
-    readonly property string iconUpdates: pluginData.iconUpdates || "system_update_alt"
+    readonly property bool autoCheck: _pd.autoCheck !== undefined ? _pd.autoCheck : true
+    readonly property int checkFrequency: parseInt(_pd.checkFrequency || "60") // minutes
+    readonly property bool checkAtStartup: _pd.checkAtStartup !== undefined ? _pd.checkAtStartup : true
+    readonly property bool confirmations: _pd.confirmations !== undefined ? _pd.confirmations : true
+    readonly property bool enableAur: _pd.enableAur !== undefined ? _pd.enableAur : true
+    readonly property bool enableFlatpak: _pd.enableFlatpak !== undefined ? _pd.enableFlatpak : true
+    readonly property bool enableAppimage: _pd.enableAppimage !== undefined ? _pd.enableAppimage : false
+    readonly property bool excludeDevelAur: _pd.excludeDevelAur !== undefined ? _pd.excludeDevelAur : false
+    readonly property bool alwaysConfirmKernel: _pd.alwaysConfirmKernel !== undefined ? _pd.alwaysConfirmKernel : false
+    readonly property string iconDefault: _pd.iconDefault || "check_circle"
+    readonly property string iconUpdates: _pd.iconUpdates || "system_update_alt"
     // Failures get their own GLYPH, not just a color — bar theming can render
     // icon colors nearly indistinguishable, so shape carries the signal.
-    readonly property string iconFailures: pluginData.iconFailures || "release_alert"
-    readonly property bool showCount: pluginData.showCount !== undefined ? pluginData.showCount : true
-    readonly property string countPositionH: pluginData.countPositionH || "right" // left | right
-    readonly property string countPositionV: pluginData.countPositionV || "bottom" // top | bottom
-    readonly property bool showTooltip: pluginData.showTooltip !== undefined ? pluginData.showTooltip : false
-    readonly property bool tooltipShowPackages: pluginData.tooltipShowPackages !== undefined ? pluginData.tooltipShowPackages : false
-    readonly property int tooltipDelay: parseInt(pluginData.tooltipDelay !== undefined ? pluginData.tooltipDelay : 500) // ms
-    readonly property bool tooltipFade: pluginData.tooltipFade !== undefined ? pluginData.tooltipFade : true
-    readonly property int detailRows: parseInt(pluginData.detailRows !== undefined ? pluginData.detailRows : 6)
-    readonly property bool showOpenShellyMenuItem: pluginData.showOpenShellyMenuItem !== undefined ? pluginData.showOpenShellyMenuItem : true
-    readonly property bool notifyOnUpdates: pluginData.notifyOnUpdates !== undefined ? pluginData.notifyOnUpdates : false
-    readonly property int notifyThreshold: parseInt(pluginData.notifyThreshold !== undefined ? pluginData.notifyThreshold : 1)
-    readonly property bool notifyOnFailures: pluginData.notifyOnFailures !== undefined ? pluginData.notifyOnFailures : true
-    readonly property string leftClickAction: pluginData.leftClickAction || "updates" // updates | menu | ui | none
-    readonly property string middleClickAction: pluginData.middleClickAction || "none"
-    readonly property string rightClickAction: pluginData.rightClickAction || "menu"
-    readonly property string terminal: pluginData.terminal || Quickshell.env("TERMINAL") || "kitty"
-    readonly property bool closeTerminalOnDone: pluginData.closeTerminalOnDone !== undefined ? pluginData.closeTerminalOnDone : false
-    readonly property bool surviveRestart: pluginData.surviveRestart !== undefined ? pluginData.surviveRestart : true
-    readonly property bool detectFailedUpdates: pluginData.detectFailedUpdates !== undefined ? pluginData.detectFailedUpdates : true
+    readonly property string iconFailures: _pd.iconFailures || "release_alert"
+    readonly property bool showCount: _pd.showCount !== undefined ? _pd.showCount : true
+    readonly property string countPositionH: _pd.countPositionH || "right" // left | right
+    readonly property string countPositionV: _pd.countPositionV || "bottom" // top | bottom
+    readonly property bool showTooltip: _pd.showTooltip !== undefined ? _pd.showTooltip : false
+    readonly property bool tooltipShowPackages: _pd.tooltipShowPackages !== undefined ? _pd.tooltipShowPackages : false
+    readonly property int tooltipDelay: parseInt(_pd.tooltipDelay !== undefined ? _pd.tooltipDelay : 500) // ms
+    readonly property bool tooltipFade: _pd.tooltipFade !== undefined ? _pd.tooltipFade : true
+    readonly property int detailRows: parseInt(_pd.detailRows !== undefined ? _pd.detailRows : 6)
+    readonly property bool showOpenShellyMenuItem: _pd.showOpenShellyMenuItem !== undefined ? _pd.showOpenShellyMenuItem : true
+    readonly property bool notifyOnUpdates: _pd.notifyOnUpdates !== undefined ? _pd.notifyOnUpdates : false
+    readonly property int notifyThreshold: parseInt(_pd.notifyThreshold !== undefined ? _pd.notifyThreshold : 1)
+    readonly property bool notifyOnFailures: _pd.notifyOnFailures !== undefined ? _pd.notifyOnFailures : true
+    readonly property string leftClickAction: _pd.leftClickAction || "updates" // updates | menu | ui | none
+    readonly property string middleClickAction: _pd.middleClickAction || "none"
+    readonly property string rightClickAction: _pd.rightClickAction || "menu"
+    readonly property string terminal: _pd.terminal || Quickshell.env("TERMINAL") || "kitty"
+    readonly property bool closeTerminalOnDone: _pd.closeTerminalOnDone !== undefined ? _pd.closeTerminalOnDone : false
+    readonly property bool surviveRestart: _pd.surviveRestart !== undefined ? _pd.surviveRestart : true
+    readonly property bool detectFailedUpdates: _pd.detectFailedUpdates !== undefined ? _pd.detectFailedUpdates : true
     // Retention for the self-kept failed-update log (days). Capped by the
     // settings slider; clamped defensively here too.
-    readonly property int failureHistoryDays: Math.max(1, Math.min(180, parseInt(pluginData.failureHistoryDays !== undefined ? pluginData.failureHistoryDays : 30)))
+    readonly property int failureHistoryDays: Math.max(1, Math.min(180, parseInt(_pd.failureHistoryDays !== undefined ? _pd.failureHistoryDays : 30)))
     // Resource limits so big (AUR) builds don't peg the machine and make the
     // desktop unresponsive. Off by default (no change to how updates run).
-    readonly property bool limitBuildResources: pluginData.limitBuildResources !== undefined ? pluginData.limitBuildResources : false
-    readonly property bool lowerPriority: pluginData.lowerPriority !== undefined ? pluginData.lowerPriority : true
-    readonly property int maxBuildJobs: parseInt(pluginData.maxBuildJobs !== undefined ? pluginData.maxBuildJobs : 0) // 0 = unlimited
+    readonly property bool limitBuildResources: _pd.limitBuildResources !== undefined ? _pd.limitBuildResources : false
+    readonly property bool lowerPriority: _pd.lowerPriority !== undefined ? _pd.lowerPriority : true
+    readonly property int maxBuildJobs: parseInt(_pd.maxBuildJobs !== undefined ? _pd.maxBuildJobs : 0) // 0 = unlimited
     // AI failure analysis: a user-configured shell command that reads a prompt
     // on stdin and prints a plain-text answer (e.g. "claude -p", "ollama run
     // llama3.2"). A CLI keeps API keys out of the plugin's plain-JSON state and
     // lets subscription accounts work without API credits.
-    readonly property bool aiEnabled: pluginData.aiEnabled !== undefined ? pluginData.aiEnabled : false
-    readonly property string aiCommand: (pluginData.aiCommand || "").trim()
+    readonly property bool aiEnabled: _pd.aiEnabled !== undefined ? _pd.aiEnabled : false
+    readonly property string aiCommand: (_pd.aiCommand || "").trim()
     readonly property bool aiReady: aiEnabled && aiCommand !== ""
     // User-editable prompt template ({placeholders} filled per failure). An
     // empty/unset setting means the built-in default below. KEEP IN SYNC with
@@ -80,9 +113,10 @@ PluginComponent {
         "{log}",
         "",
         "Briefly explain what went wrong, then give concrete numbered fix steps the user can run.",
+        "Put each runnable shell command on its own line, prefixed with \"$ \" (dollar + space) and nothing else on that line, so it can be copied and run directly.",
         "Plain text only — no markdown syntax. Keep it under 200 words."
     ].join("\n")
-    readonly property string aiPromptTemplate: (pluginData.aiPromptTemplate || "").trim() !== "" ? pluginData.aiPromptTemplate : aiPromptDefault
+    readonly property string aiPromptTemplate: (_pd.aiPromptTemplate || "").trim() !== "" ? _pd.aiPromptTemplate : aiPromptDefault
 
     // ---- Live state ----
     property var pacmanUpdates: []
@@ -193,6 +227,17 @@ PluginComponent {
     // "The last run left failures" — drives the bar glyph, the updates-view
     // banner, and the failure notification. Cleared when a new upgrade starts.
     readonly property bool hasFailures: failedPackages.length > 0
+    // Summary of the most recent upgrade run: { when, attempted, successful,
+    // failed }. Persisted + broadcast; shown on the "Update History" menu item.
+    // successful = attempted − failed (the names we submitted that then applied).
+    property var lastRunSummary: null
+    function lastRunSummaryText() {
+        var s = root.lastRunSummary;
+        if (!s || !s.attempted)
+            return "";
+        var bad = s.failed + (s.failed === 1 ? " failure" : " failures");
+        return "Last update: " + s.successful + " successful, " + bad;
+    }
     property bool _awaitingUpgradeResult: false
     property int _lastUpgradeExit: 0
     property string _lastLogText: ""          // captured session output of last run
@@ -239,6 +284,109 @@ PluginComponent {
         } catch (e) {
             root.failureHistory = [];
         }
+        _mergeAiSidecar();
+    }
+    // Restore everything persisted in plugin state (failure history, failed
+    // flags, last-run summary). The control-center widget is a SEPARATE plugin
+    // instance whose pluginService is often not wired for state reads — so when
+    // pluginService is unavailable we fall back to reading the on-disk state
+    // file directly via a Process (the same approach loadHistory uses for
+    // pacman.log). Without this the CC history shows no failures.
+    readonly property string _statePath: (Quickshell.env("XDG_STATE_HOME")
+        || (Quickshell.env("HOME") + "/.local/state"))
+        + "/DankMaterialShell/plugins/shellyUpdater_state.json"
+    // AI answers are stored in a small append-only JSONL sidecar (one
+    // {name,when,ai} record per line, last-wins) rather than the main state, so
+    // they persist even when generated in the control-center instance (which has
+    // no pluginService to savePluginState with). Both instances write it via
+    // sh/printf and merge it into failureHistory on load.
+    readonly property string _aiSidecarPath: (Quickshell.env("XDG_STATE_HOME")
+        || (Quickshell.env("HOME") + "/.local/state"))
+        + "/DankMaterialShell/plugins/shellyUpdater_ai.jsonl"
+    function _mergeAiSidecar() {
+        aiSidecarReadProc.running = true;
+    }
+    Process {
+        id: aiSidecarReadProc
+        command: ["cat", root._aiSidecarPath]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var recs = [];
+                var lines = (text || "").split("\n");
+                for (var i = 0; i < lines.length; i++) {
+                    var ln = lines[i].trim();
+                    if (!ln) continue;
+                    try { recs.push(JSON.parse(ln)); } catch (e) {}
+                }
+                if (recs.length === 0)
+                    return;
+                var list = root.failureHistory.slice();
+                var changed = false;
+                for (var j = 0; j < list.length; j++) {
+                    var ai; // last matching record wins
+                    for (var r = recs.length - 1; r >= 0; r--) {
+                        if (recs[r].name === list[j].name && recs[r].when === list[j].when) {
+                            ai = recs[r].ai;
+                            break;
+                        }
+                    }
+                    if (ai !== undefined && list[j].ai !== ai) {
+                        var upd = JSON.parse(JSON.stringify(list[j]));
+                        upd.ai = ai;
+                        list[j] = upd;
+                        changed = true;
+                    }
+                }
+                if (changed)
+                    root.failureHistory = list;
+            }
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+    }
+    Process { id: aiSidecarWriteProc }
+    function _loadPersistedState() {
+        _ensureSettings(); // settings fall back to the file too (CC instance)
+        if (pluginService && pluginService.loadPluginState) {
+            loadFailureHistory();
+            try {
+                root.failedPackages = JSON.parse(pluginService.loadPluginState(pluginId, "failedPackages", "[]"));
+            } catch (e) {}
+            try {
+                root.lastRunSummary = JSON.parse(pluginService.loadPluginState(pluginId, "lastRunSummary", "null"));
+            } catch (e2) {}
+        }
+        // Fallback (also when the pluginService store came back empty, as it can
+        // for the control-center instance): read the on-disk state file. Cheap
+        // (one cat) and only reached when we have no failures in memory.
+        if (root.failureHistory.length === 0)
+            stateFileProc.running = true;
+    }
+    // Values in the state file are JSON strings (double-encoded), so each is
+    // parsed twice.
+    function _decodeStateValue(v) {
+        try { return typeof v === "string" ? JSON.parse(v) : v; } catch (e) { return null; }
+    }
+    Process {
+        id: stateFileProc
+        command: ["cat", root._statePath]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    var d = JSON.parse(text || "{}");
+                    var fh = root._decodeStateValue(d.failureHistory);
+                    if (Array.isArray(fh))
+                        root.failureHistory = root._pruneFailureHistory(fh);
+                    var fp = root._decodeStateValue(d.failedPackages);
+                    if (Array.isArray(fp))
+                        root.failedPackages = fp;
+                    var lrs = root._decodeStateValue(d.lastRunSummary);
+                    if (lrs)
+                        root.lastRunSummary = lrs;
+                    root._mergeAiSidecar();
+                } catch (e) {}
+            }
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
     }
     // Tail of the captured (ANSI-stripped) session log, bounded so the state
     // file stays small. Stored per failure so the detail view can show why it
@@ -388,6 +536,12 @@ PluginComponent {
             try {
                 root.failedPackages = JSON.parse(fp);
             } catch (e) {
+                // keep current value
+            }
+            var lrs = root.pluginService.loadPluginState(root.pluginId, "lastRunSummary", "null");
+            try {
+                root.lastRunSummary = JSON.parse(lrs);
+            } catch (elrs) {
                 // keep current value
             }
             var fh = root.pluginService.loadPluginState(root.pluginId, "failureHistory", "[]");
@@ -908,12 +1062,23 @@ PluginComponent {
             : (hardFail ? "Transaction failed"
             : (root._lastUpgradeExit !== 0 ? "Update failed" : "Did not apply")));
         _recordFailures(failed, reason, clean, reasonByName);
+        // Record the run summary for the History menu label. attempted = what we
+        // submitted; successful = attempted that didn't end up failed.
+        var attempted = (root.attemptedUpdate || []).length;
+        root.lastRunSummary = {
+            when: _nowStamp(),
+            attempted: attempted,
+            failed: failed.length,
+            successful: Math.max(0, attempted - failed.length)
+        };
         root._broadcastFailed();
         _notifyFailures(failed);
     }
     function _broadcastFailed() {
-        if (pluginService && pluginService.savePluginState)
+        if (pluginService && pluginService.savePluginState) {
             pluginService.savePluginState(pluginId, "failedPackages", JSON.stringify(root.failedPackages));
+            pluginService.savePluginState(pluginId, "lastRunSummary", JSON.stringify(root.lastRunSummary));
+        }
     }
 
     function viewLastLog() {
@@ -1188,7 +1353,7 @@ PluginComponent {
             out.push({
                 when: f.when, action: "failed", name: f.name,
                 oldVersion: f.oldVersion, newVersion: f.newVersion,
-                source: f.source, reason: f.reason, log: f.log
+                source: f.source, reason: f.reason, log: f.log, ai: f.ai
             });
         }
         out.sort(function (a, b) { return root._stampToEpoch(b.when) - root._stampToEpoch(a.when); });
@@ -1204,7 +1369,7 @@ PluginComponent {
         historyProc.running = true;
     }
     function openHistory() {
-        loadFailureHistory();
+        _loadPersistedState();
         loadHistory();
         openMode("history");
     }
@@ -1223,7 +1388,7 @@ PluginComponent {
     // to the history list (failed rows at top by recency). History is loaded
     // either way so the detail view's back button lands somewhere populated.
     function openFailures(runAi) {
-        loadFailureHistory();
+        _loadPersistedState();
         loadHistory();
         var entry = null;
         if (root.failedPackages.length === 1) {
@@ -1454,6 +1619,47 @@ PluginComponent {
         root.failureHistory = list;
         if (pluginService && pluginService.savePluginState)
             pluginService.savePluginState(pluginId, "failureHistory", JSON.stringify(root.failureHistory));
+        // Persist to the sidecar too, so an answer generated in the control
+        // center (no pluginService) survives a reopen. Append one JSONL record;
+        // the value is passed as an argv (array form → no shell escaping).
+        var rec = JSON.stringify({ name: e.name, when: e.when, ai: answer });
+        aiSidecarWriteProc.command = ["sh", "-c", "printf '%s\\n' \"$1\" >> \"$2\"", "shelly-ai", rec, root._aiSidecarPath];
+        aiSidecarWriteProc.running = true;
+    }
+
+    // Split an AI answer into ordered segments: prose text blocks and runnable
+    // commands (lines the prompt asked the model to prefix with "$ "). Each
+    // segment is { cmd: bool, value: string }.
+    function _aiSegments(text) {
+        var out = [];
+        var buf = [];
+        function flush() {
+            var t = buf.join("\n").replace(/^\s+|\s+$/g, "");
+            if (t !== "")
+                out.push({ cmd: false, value: t });
+            buf = [];
+        }
+        var lines = String(text || "").split("\n");
+        for (var i = 0; i < lines.length; i++) {
+            var m = /^\s*\$\s+(\S.*?)\s*$/.exec(lines[i]);
+            if (m) {
+                flush();
+                out.push({ cmd: true, value: m[1] });
+            } else {
+                buf.push(lines[i]);
+            }
+        }
+        flush();
+        return out;
+    }
+    // Run an AI-suggested command in a VISIBLE terminal (it may need sudo, and
+    // the user should see exactly what runs and be able to abort). Held open on
+    // a prompt afterwards. Deliberately NOT wrapped in shelly/flock.
+    function runAiCommand(cmd) {
+        if (!cmd || !cmd.trim())
+            return;
+        var inner = cmd + "; echo; echo '── Command finished ── Press Enter to close'; read _";
+        Quickshell.execDetached(_launchArgv(inner));
     }
 
     function openPluginSettings() {
@@ -1521,19 +1727,21 @@ PluginComponent {
     }
 
     Component.onCompleted: {
-        loadFailureHistory();
         envProc.running = true; // detect {environment} for AI prompts
-        // Restore the last run's failure flags so a DMS restart doesn't hide
-        // that something went wrong (they clear when the next upgrade starts).
-        if (pluginService && pluginService.loadPluginState) {
-            try {
-                root.failedPackages = JSON.parse(pluginService.loadPluginState(pluginId, "failedPackages", "[]"));
-            } catch (e) {
-                // keep default
-            }
-        }
+        // pluginService is usually NULL here (assigned after) — _loadPersistedState
+        // no-ops then and re-runs from onPluginServiceChanged below.
+        _loadPersistedState();
         if (checkAtStartup)
             Qt.callLater(function () { root.refresh(true); });
+    }
+    // pluginService arrives after Component.onCompleted. The bar recovers via
+    // state broadcasts, but a fresh control-center instance gets none — so load
+    // persisted state (failure history, failed flags, last-run summary) as soon
+    // as the service is wired, or the CC history shows no failures. Separate
+    // Connections so we don't clobber any base onPluginServiceChanged handler.
+    Connections {
+        target: root
+        function onPluginServiceChanged() { root._loadPersistedState(); }
     }
 
     Loader {
@@ -1662,19 +1870,23 @@ PluginComponent {
     }
 
     // Reusable menu row (top-level: nested inline components are unsupported).
+    // An optional itemSubtitle adds a second, muted line and grows the row.
     component MenuItem: Rectangle {
         property string itemIcon: ""
         property string itemLabel: ""
+        property string itemSubtitle: ""
         property string badge: ""
         signal triggered
         width: parent ? parent.width - (parent.leftPadding || 0) - (parent.rightPadding || 0) : 0
-        height: 44
+        height: itemSubtitle !== "" ? 54 : 44
         radius: Theme.cornerRadius
         color: mHover.containsMouse ? Theme.primaryHoverLight : "transparent"
         Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
         Row {
             anchors.left: parent.left
             anchors.leftMargin: Theme.spacingM
+            anchors.right: mBadge.left
+            anchors.rightMargin: Theme.spacingS
             anchors.verticalCenter: parent.verticalCenter
             spacing: Theme.spacingM
             DankIcon {
@@ -1683,14 +1895,25 @@ PluginComponent {
                 size: Theme.iconSize - 2
                 color: Theme.surfaceText
             }
-            StyledText {
+            Column {
                 anchors.verticalCenter: parent.verticalCenter
-                text: itemLabel
-                font.pixelSize: Theme.fontSizeMedium
-                color: Theme.surfaceText
+                spacing: 1
+                StyledText {
+                    text: itemLabel
+                    font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.surfaceText
+                }
+                StyledText {
+                    text: itemSubtitle
+                    visible: itemSubtitle !== ""
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    elide: Text.ElideRight
+                }
             }
         }
         StyledText {
+            id: mBadge
             anchors.right: parent.right
             anchors.rightMargin: Theme.spacingM
             anchors.verticalCenter: parent.verticalCenter
@@ -1699,6 +1922,7 @@ PluginComponent {
             font.weight: Font.Medium
             color: Theme.primary
             visible: badge !== ""
+            width: visible ? implicitWidth : 0
         }
         MouseArea {
             id: mHover
@@ -2419,6 +2643,9 @@ PluginComponent {
         // and held-packages entries are hidden — they navigate to popout-only
         // views the CC panel doesn't host.
         signal dismissRequested()
+        // Open the update-history view — the host decides where (bar popout
+        // history mode; control-center history sub-view).
+        signal historyRequested()
         property bool embedded: false
         readonly property real contentWidth: width - leftPadding - rightPadding
         width: parent ? parent.width : 0
@@ -2471,9 +2698,10 @@ PluginComponent {
         Rectangle { width: mv.contentWidth; height: 1; color: Theme.outline; opacity: 0.3 }
 
         MenuItem {
-            visible: !mv.embedded; height: visible ? 44 : 0
+            // Shown in both surfaces; the host routes historyRequested().
             itemIcon: "history"; itemLabel: "Update History…"
-            onTriggered: root.openHistory()
+            itemSubtitle: root.lastRunSummaryText()
+            onTriggered: mv.historyRequested()
         }
         MenuItem {
             visible: !mv.embedded; height: visible ? 44 : 0
@@ -2929,7 +3157,8 @@ PluginComponent {
                 CcSegButton {
                     width: ccToggle.segWidth
                     segKey: "menu"; segIcon: "menu"; segLabel: "Menu"
-                    active: ccPanel.ccView === "menu"
+                    // History / failure-detail are reached from the menu.
+                    active: ccPanel.ccView === "menu" || ccPanel.ccView === "history" || ccPanel.ccView === "faildetail"
                     onPicked: ccPanel.ccView = "menu"
                 }
                 CcSegButton {
@@ -2937,7 +3166,7 @@ PluginComponent {
                     segKey: "updates"; segIcon: "format_list_bulleted"
                     segLabel: "Updates" + (root.updateCount > 0 ? " (" + root.updateCount + ")" : "")
                     // Stays active while drilled into a package's detail.
-                    active: ccPanel.ccView !== "menu"
+                    active: ccPanel.ccView === "updates" || ccPanel.ccView === "detail"
                     onPicked: ccPanel.ccView = "updates"
                 }
                 Rectangle {
@@ -2998,6 +3227,11 @@ PluginComponent {
                         id: ccMenu
                         embedded: true
                         onDismissRequested: PopoutService.closeControlCenter && PopoutService.closeControlCenter()
+                        onHistoryRequested: {
+                            root.loadHistory();
+                            root._loadPersistedState(); // pluginService-or-file
+                            ccPanel.ccView = "history";
+                        }
                     }
                 }
 
@@ -3025,7 +3259,702 @@ PluginComponent {
                     onBackRequested: ccPanel.ccView = "updates"
                     onDismissRequested: PopoutService.closeControlCenter && PopoutService.closeControlCenter()
                 }
+
+                // History sub-view (from the Menu). Back returns to the menu; a
+                // failed row drills into the failure detail.
+                HistoryView {
+                    visible: ccPanel.ccView === "history"
+                    embedded: true
+                    embeddedListHeight: Math.max(root.detailRowHeight, ccContent.height - 96)
+                    onBackRequested: ccPanel.ccView = "menu"
+                    onFailureActivated: entry => {
+                        root.aiError = "";
+                        root.failureDetail = entry;
+                        ccPanel.ccView = "faildetail";
+                    }
+                }
+
+                // Failure-detail sub-view (from history). Scrolls as a whole so
+                // the reason, AI suggestion and log never clip. Back → history.
+                Flickable {
+                    anchors.fill: parent
+                    visible: ccPanel.ccView === "faildetail"
+                    clip: true
+                    contentWidth: width
+                    contentHeight: ccFailDetail.implicitHeight
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    FailDetailView {
+                        id: ccFailDetail
+                        embedded: true
+                        embeddedBodyHeight: 140
+                        onBackRequested: ccPanel.ccView = "history"
+                        onDismissRequested: PopoutService.closeControlCenter && PopoutService.closeControlCenter()
+                    }
+                }
             }
+        }
+    }
+
+    // =====================================================================
+    // History + failure-detail views (top-level so the control-center panel
+    // can host them too). backRequested/dismissRequested decouple from the
+    // popout; embedded fits the CC panel.
+    // =====================================================================
+    // ---------------- Update history ----------------
+    component HistoryView: Column {
+        id: hyv
+        // backRequested = back to the menu; failureActivated = a failed row was
+        // clicked (host opens its failure-detail view). embedded fits the CC.
+        signal backRequested()
+        signal failureActivated(var entry)
+        property bool embedded: false
+        property real embeddedListHeight: 0
+        readonly property real contentWidth: width - leftPadding - rightPadding
+        width: parent ? parent.width : 0
+        padding: hyv.embedded ? 0 : root.popoutPad
+        spacing: hyv.embedded ? Theme.spacingS : Theme.spacingM
+
+        // Text filter (matches name/version) + optional failed-only / AI-only.
+        property string filterText: ""
+        property bool failedOnly: false
+        property bool aiOnly: false
+        readonly property bool hasFailures: root.historyCombined.some(function (i) { return i.action === "failed"; })
+        readonly property bool hasAi: root.historyCombined.some(function (i) { return i.ai !== undefined && i.ai !== ""; })
+        readonly property var filteredItems: {
+            var base = root.historyCombined;
+            if (aiOnly)
+                base = base.filter(function (i) { return i.ai !== undefined && i.ai !== ""; });
+            else if (failedOnly)
+                base = base.filter(function (i) { return i.action === "failed"; });
+            if (filterText !== "")
+                base = base.filter(function (i) { return root._matchesFilter(i, hyv.filterText); });
+            return base;
+        }
+        // Sort: name or update date.
+        readonly property var displayItems: {
+            var arr = filteredItems.slice();
+            var dir = histSort.asc ? 1 : -1;
+            var key = histSort.activeKey;
+            arr.sort(function (a, b) {
+                var c;
+                if (key === "name") {
+                    c = String(a.name || "").localeCompare(String(b.name || ""));
+                    if (c === 0)
+                        c = root._stampToEpoch(a.when) - root._stampToEpoch(b.when);
+                } else {
+                    c = root._stampToEpoch(a.when) - root._stampToEpoch(b.when);
+                }
+                return c * dir;
+            });
+            return arr;
+        }
+
+        // Header: back to menu + title + count
+        Item {
+            width: hyv.contentWidth
+            height: 40
+            DankActionButton {
+                id: histBack
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                buttonSize: 28
+                iconName: "arrow_back"
+                iconSize: 18
+                iconColor: Theme.surfaceText
+                onClicked: hyv.backRequested()
+            }
+            StyledText {
+                anchors.left: histBack.right
+                anchors.leftMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Update History"
+                font.pixelSize: Theme.fontSizeLarge
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+            }
+            Row {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingS
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.historyLoading ? "Loading…" : (hyv.displayItems.length + " entries")
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                }
+                DankActionButton {
+                    buttonSize: 28
+                    iconName: "refresh"
+                    iconSize: 18
+                    iconColor: Theme.surfaceText
+                    onClicked: root.loadHistory()
+                }
+            }
+        }
+
+        // Text filter — search history by package name or version.
+        DankTextField {
+            width: hyv.contentWidth
+            height: 40
+            visible: root.historyCombined.length > 0
+            leftIconName: "search"
+            showClearButton: true
+            placeholderText: "Filter history…"
+            text: hyv.filterText
+            onTextEdited: hyv.filterText = text
+        }
+
+        // Sort selector (name / date) + failed-only filter toggle.
+        Item {
+            width: hyv.contentWidth
+            height: 24
+            visible: root.historyCombined.length > 0
+            SortChips {
+                id: histSort
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                activeKey: "date"
+                asc: false
+                options: [ { key: "date", label: "Date" }, { key: "name", label: "Name" } ]
+            }
+            Row {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingXS
+                FilterChip {
+                    visible: hyv.hasAi
+                    label: "AI fix"
+                    icon: "neurology"
+                    activeColor: Theme.primary
+                    active: hyv.aiOnly
+                    onToggled: { hyv.aiOnly = !hyv.aiOnly; if (hyv.aiOnly) hyv.failedOnly = false; }
+                }
+                FilterChip {
+                    visible: hyv.hasFailures
+                    label: "Failed only"
+                    icon: "error"
+                    activeColor: Theme.error
+                    active: hyv.failedOnly
+                    onToggled: { hyv.failedOnly = !hyv.failedOnly; if (hyv.failedOnly) hyv.aiOnly = false; }
+                }
+            }
+        }
+
+        Rectangle {
+            width: hyv.contentWidth
+            height: hyv.embedded
+                ? Math.max(root.detailRowHeight, hyv.embeddedListHeight)
+                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
+            radius: Theme.cornerRadius
+            color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
+
+            StyledText {
+                anchors.centerIn: parent
+                width: parent.width - Theme.spacingL * 2
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                visible: !root.historyLoading && hyv.displayItems.length === 0
+                text: {
+                    if (root.historyCombined.length === 0)
+                        return "No update history found in the package log.";
+                    if (hyv.failedOnly && hyv.filterText === "")
+                        return "No failed updates recorded.";
+                    return "No history entries match \"" + hyv.filterText + "\"";
+                }
+                color: Theme.surfaceText
+                font.pixelSize: Theme.fontSizeMedium
+            }
+
+            DankListView {
+                anchors.fill: parent
+                anchors.margins: Theme.spacingS
+                visible: hyv.displayItems.length > 0
+                clip: true
+                spacing: Theme.spacingXS
+                model: hyv.displayItems
+
+                delegate: Rectangle {
+                    required property var modelData
+                    readonly property bool isFailed: modelData.action === "failed"
+                    readonly property bool isDowngrade: modelData.action === "downgraded"
+                    // Accent color per row kind: failed → error, downgrade
+                    // → warning, upgrade → primary.
+                    readonly property color accent: isFailed ? Theme.error : (isDowngrade ? Theme.warning : Theme.primary)
+                    width: ListView.view ? ListView.view.width : 0
+                    height: root.detailRowHeight
+                    radius: Theme.cornerRadius
+                    color: histHover.containsMouse ? Theme.primaryHoverLight
+                        : (isFailed ? Theme.withAlpha(Theme.error, 0.08) : "transparent")
+                    Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+                    // Failed rows open a detail view (reason + captured
+                    // log); successful rows are informational only.
+                    MouseArea {
+                        id: histHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: isFailed ? Qt.PointingHandCursor : Qt.ArrowCursor
+                        acceptedButtons: isFailed ? Qt.LeftButton : Qt.NoButton
+                        onClicked: {
+                            if (isFailed)
+                                hyv.failureActivated(modelData);
+                        }
+                    }
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingM
+
+                        Rectangle {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 24
+                            height: 24
+                            radius: 12
+                            color: Theme.withAlpha(accent, isFailed ? 0.18 : (isDowngrade ? 0.20 : 0.15))
+                            DankIcon {
+                                anchors.centerIn: parent
+                                name: isFailed ? "error" : (isDowngrade ? "arrow_downward" : "arrow_upward")
+                                size: Theme.fontSizeSmall + 2
+                                color: accent
+                            }
+                        }
+
+                        Column {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: parent.width - 24 - Theme.spacingM * 2 - whenText.width - (isFailed ? chev.width + Theme.spacingM : 0)
+                            spacing: 2
+                            Row {
+                                width: parent.width
+                                spacing: Theme.spacingXS
+                                StyledText {
+                                    width: Math.min(implicitWidth, parent.width
+                                        - (failChip.visible ? failChip.width + Theme.spacingXS : 0)
+                                        - (aiChip.visible ? aiChip.width + Theme.spacingXS : 0))
+                                    text: modelData.name
+                                    font.pixelSize: Theme.fontSizeMedium
+                                    font.weight: Font.Medium
+                                    color: Theme.surfaceText
+                                    wrapMode: Text.NoWrap
+                                    maximumLineCount: 1
+                                    elide: Text.ElideRight
+                                }
+                                // Small "failed" chip so a failed row reads
+                                // as a failure even at a glance.
+                                Rectangle {
+                                    id: failChip
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    visible: isFailed
+                                    width: failChipText.implicitWidth + Theme.spacingS
+                                    height: 16
+                                    radius: Theme.cornerRadius
+                                    color: Theme.withAlpha(Theme.error, 0.22)
+                                    StyledText {
+                                        id: failChipText
+                                        anchors.centerIn: parent
+                                        text: "failed"
+                                        font.pixelSize: Theme.fontSizeSmall - 2
+                                        font.weight: Font.Bold
+                                        color: Theme.error
+                                    }
+                                }
+                                // "AI" chip when this failure has a saved AI fix.
+                                Rectangle {
+                                    id: aiChip
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    visible: modelData.ai !== undefined && modelData.ai !== ""
+                                    width: aiChipRow.implicitWidth + Theme.spacingS
+                                    height: 16
+                                    radius: Theme.cornerRadius
+                                    color: Theme.withAlpha(Theme.primary, 0.20)
+                                    Row {
+                                        id: aiChipRow
+                                        anchors.centerIn: parent
+                                        spacing: 1
+                                        DankIcon {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            name: "neurology"
+                                            size: Theme.fontSizeSmall - 1
+                                            color: Theme.primary
+                                        }
+                                        StyledText {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: "AI"
+                                            font.pixelSize: Theme.fontSizeSmall - 2
+                                            font.weight: Font.Bold
+                                            color: Theme.primary
+                                        }
+                                    }
+                                }
+                            }
+                            StyledText {
+                                width: parent.width
+                                text: {
+                                    var ver = (modelData.oldVersion || "?") + "  →  " + (modelData.newVersion || "?");
+                                    if (isFailed) {
+                                        var hasVer = (modelData.oldVersion || "") !== "" || (modelData.newVersion || "") !== "";
+                                        return (modelData.reason || "Failed") + (hasVer ? "  ·  " + ver : "");
+                                    }
+                                    return ver;
+                                }
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: accent
+                                wrapMode: Text.NoWrap
+                                maximumLineCount: 1
+                                elide: Text.ElideRight
+                            }
+                        }
+
+                        StyledText {
+                            id: whenText
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root._fmtHistoryWhen(modelData.when)
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                        }
+
+                        // Click affordance — only failed rows are clickable.
+                        DankIcon {
+                            id: chev
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: isFailed
+                            name: "chevron_right"
+                            size: Theme.iconSize - 4
+                            color: Theme.error
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Detail for a single failed update: reason, attempted version,
+    // source, full timestamp, and the captured log tail (if saved).
+    component FailDetailView: Column {
+        id: fdv
+        // backRequested = back to the history list; dismissRequested = close the
+        // whole surface (so running a command hands focus to the new terminal).
+        // embedded fits the CC panel (host-driven body/log height).
+        signal backRequested()
+        signal dismissRequested()
+        property bool embedded: false
+        property real embeddedBodyHeight: 0
+        readonly property real contentWidth: width - leftPadding - rightPadding
+        width: parent ? parent.width : 0
+        padding: fdv.embedded ? 0 : root.popoutPad
+        spacing: fdv.embedded ? Theme.spacingS : Theme.spacingM
+
+        readonly property var entry: root.failureDetail || ({})
+        readonly property string logText: entry && entry.log ? entry.log : ""
+        readonly property bool hasVersions: (entry.oldVersion || "") !== "" || (entry.newVersion || "") !== ""
+        readonly property var fields: {
+            var f = [{ label: "Reason", value: entry.reason || "Failed", err: true }];
+            if (entry.source)
+                f.push({ label: "Source", value: entry.source, err: false });
+            if (hasVersions)
+                f.push({ label: "Attempted", value: (entry.oldVersion || "?") + "  →  " + (entry.newVersion || "?"), err: false });
+            f.push({ label: "When", value: root._fmtHistoryWhen(entry.when || ""), err: false });
+            if (entry.reason === root.reasonPkgbuildDiff)
+                f.push({ label: "Fix", value: "The package's PKGBUILD changed, so Shelly refused to build it non-interactively. Run \"shelly aur update " + (entry.name || "<pkg>") + "\" in a terminal, review the diff, and accept it — updates from here will work again afterwards.", err: false });
+            if (entry.reason === root.reasonDepConflict)
+                f.push({ label: "Fix", value: "An upgrade needs a newer shared library (soname) than a held or AUR package provides — held packages aren't upgraded but still block resolution, so the whole transaction is refused. This usually means a package group must be rebuilt together against the new library (e.g. the hypr* -git stack after a libhyprutils soname bump): rebuild the whole group in one go, then run the update again. See the \"breaks dependency …\" lines in the log below for the exact library and packages involved.", err: false });
+            return f;
+        }
+
+        // Header: back to history + name + "failed" chip
+        Item {
+            width: fdv.contentWidth
+            height: 40
+            DankActionButton {
+                id: fdBack
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                buttonSize: 28
+                iconName: "arrow_back"
+                iconSize: 18
+                iconColor: Theme.surfaceText
+                onClicked: fdv.backRequested()
+            }
+            StyledText {
+                anchors.left: fdBack.right
+                anchors.leftMargin: Theme.spacingS
+                anchors.right: fdChip.left
+                anchors.rightMargin: Theme.spacingS
+                anchors.verticalCenter: parent.verticalCenter
+                text: fdv.entry.name || ""
+                font.pixelSize: Theme.fontSizeLarge
+                font.weight: Font.Medium
+                color: Theme.surfaceText
+                elide: Text.ElideRight
+            }
+            Rectangle {
+                id: fdChip
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: 52
+                height: 20
+                radius: Theme.cornerRadius
+                color: Theme.withAlpha(Theme.error, 0.22)
+                StyledText {
+                    anchors.centerIn: parent
+                    text: "failed"
+                    font.pixelSize: Theme.fontSizeSmall - 1
+                    font.weight: Font.Bold
+                    color: Theme.error
+                }
+            }
+        }
+
+        // Structured fields
+        Column {
+            width: fdv.contentWidth
+            spacing: Theme.spacingXS
+            Repeater {
+                model: fdv.fields
+                delegate: Row {
+                    required property var modelData
+                    width: fdv.contentWidth
+                    spacing: Theme.spacingM
+                    StyledText {
+                        width: 96
+                        text: modelData.label
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceVariantText
+                    }
+                    StyledText {
+                        width: parent.width - 96 - Theme.spacingM
+                        text: modelData.value
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: modelData.err ? Theme.error : Theme.surfaceText
+                        wrapMode: Text.WrapAnywhere
+                    }
+                }
+            }
+        }
+
+        // ---- AI failure analysis ----
+        readonly property string aiText: (entry && entry.ai) ? entry.ai : ""
+
+        DetailActionButton {
+            width: fdv.contentWidth
+            visible: root.aiReady && fdv.aiText === "" && !root.aiLoading
+            icon: "neurology"
+            label: "Suggest fix with AI"
+            onTriggered: root.requestAiSuggestion()
+        }
+        // In-flight indicator (click to cancel).
+        Rectangle {
+            width: fdv.contentWidth
+            visible: root.aiLoading
+            height: visible ? 40 : 0
+            radius: Theme.cornerRadius
+            color: Theme.secondaryHover
+            Row {
+                anchors.centerIn: parent
+                spacing: Theme.spacingS
+                DankIcon {
+                    id: aiSpinner
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "progress_activity"
+                    size: Theme.iconSize - 2
+                    color: Theme.primary
+                    RotationAnimation on rotation {
+                        from: 0; to: 360; duration: 1000
+                        loops: Animation.Infinite; running: root.aiLoading
+                        onRunningChanged: { if (!running) aiSpinner.rotation = 0; }
+                    }
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Asking the AI… (click to cancel)"
+                    font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.surfaceText
+                }
+            }
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.cancelAiSuggestion()
+            }
+        }
+        StyledText {
+            width: fdv.contentWidth
+            visible: root.aiError !== "" && !root.aiLoading
+            text: root.aiError
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.error
+            wrapMode: Text.WordWrap
+        }
+        // "AI suggestion" header with a re-run button (regenerate — useful when
+        // a prior run errored, e.g. the AI CLI wasn't authenticated, and its
+        // error text got saved as the "answer").
+        Item {
+            width: fdv.contentWidth
+            visible: fdv.aiText !== ""
+            height: visible ? 24 : 0
+            StyledText {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "AI suggestion"
+                font.pixelSize: Theme.fontSizeSmall
+                font.weight: Font.Medium
+                color: Theme.surfaceVariantText
+            }
+            DankActionButton {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                buttonSize: 24
+                iconName: "refresh"
+                iconSize: 14
+                iconColor: Theme.surfaceVariantText
+                enabled: root.aiReady && !root.aiLoading
+                opacity: enabled ? 1.0 : 0.4
+                tooltipText: root.aiReady ? "Re-run the AI suggestion" : "Configure an AI command in Settings → AI"
+                onClicked: root.requestAiSuggestion()
+            }
+        }
+        Rectangle {
+            width: fdv.contentWidth
+            visible: fdv.aiText !== ""
+            height: visible ? Math.min(aiCol.implicitHeight + Theme.spacingM * 2,
+                                       fdv.embedded ? 220 : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS))) : 0
+            radius: Theme.cornerRadius
+            color: Theme.withAlpha(Theme.primary, 0.08)
+            border.width: 1
+            border.color: Theme.withAlpha(Theme.primary, 0.25)
+
+            Flickable {
+                anchors.fill: parent
+                anchors.margins: Theme.spacingM
+                clip: true
+                contentHeight: aiCol.implicitHeight
+                contentWidth: width
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                Column {
+                    id: aiCol
+                    width: parent.width
+                    spacing: Theme.spacingXS
+                    Repeater {
+                        // Prose blocks render as text; "$ " command lines render
+                        // as a mono row with copy + run buttons.
+                        model: root._aiSegments(fdv.aiText)
+                        delegate: Item {
+                            required property var modelData
+                            width: aiCol.width
+                            implicitHeight: modelData.cmd ? cmdRow.height : txtBlock.implicitHeight
+                            StyledText {
+                                id: txtBlock
+                                visible: !modelData.cmd
+                                width: parent.width
+                                text: modelData.value
+                                font.pixelSize: Theme.fontSizeSmall
+                                color: Theme.surfaceText
+                                wrapMode: Text.WordWrap
+                            }
+                            Rectangle {
+                                id: cmdRow
+                                visible: modelData.cmd
+                                width: parent.width
+                                height: visible ? Math.max(30, cmdText.implicitHeight + Theme.spacingXS * 2) : 0
+                                radius: Theme.cornerRadius
+                                color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.3)
+                                StyledText {
+                                    id: cmdText
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: Theme.spacingS
+                                    anchors.right: cmdBtns.left
+                                    anchors.rightMargin: Theme.spacingXS
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: modelData.value
+                                    font.family: Theme.monoFontFamily
+                                    font.pixelSize: Theme.fontSizeSmall - 1
+                                    color: Theme.primary
+                                    wrapMode: Text.WrapAnywhere
+                                }
+                                Row {
+                                    id: cmdBtns
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: Theme.spacingXS
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 0
+                                    DankActionButton {
+                                        buttonSize: 26
+                                        iconName: "content_copy"
+                                        iconSize: 14
+                                        iconColor: Theme.surfaceVariantText
+                                        tooltipText: "Copy"
+                                        onClicked: Quickshell.execDetached(["dms", "cl", "copy", modelData.value])
+                                    }
+                                    DankActionButton {
+                                        buttonSize: 26
+                                        iconName: "play_arrow"
+                                        iconSize: 16
+                                        iconColor: Theme.primary
+                                        tooltipText: "Run in a terminal"
+                                        onClicked: {
+                                            root.runAiCommand(modelData.value);
+                                            fdv.dismissRequested(); // close so focus goes to the terminal
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Captured log tail
+        StyledText {
+            width: fdv.contentWidth
+            text: fdv.logText !== "" ? "Log (tail of the failed run)" : "No log was saved for this failure."
+            font.pixelSize: Theme.fontSizeSmall
+            font.weight: Font.Medium
+            color: Theme.surfaceVariantText
+        }
+        Rectangle {
+            width: fdv.contentWidth
+            visible: fdv.logText !== ""
+            height: fdv.embedded
+                ? Math.max(root.detailRowHeight, fdv.embeddedBodyHeight)
+                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
+            radius: Theme.cornerRadius
+            color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
+
+            Flickable {
+                id: logFlick
+                anchors.fill: parent
+                anchors.margins: Theme.spacingM
+                clip: true
+                contentHeight: logCol.height
+                contentWidth: width
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                Column {
+                    id: logCol
+                    width: logFlick.width
+                    StyledText {
+                        width: parent.width
+                        text: fdv.logText
+                        font.family: Theme.monoFontFamily
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.surfaceText
+                        wrapMode: Text.WrapAnywhere
+                    }
+                }
+            }
+        }
+
+        // Open the full live log — only meaningful for the most recent
+        // run (older runs' logs are gone; we only kept the excerpt).
+        DetailActionButton {
+            width: fdv.contentWidth
+            visible: root._isFailed(fdv.entry.name)
+            icon: "description"
+            label: "View full log"
+            onTriggered: root.viewLastLog()
         }
     }
 
@@ -3077,7 +4006,10 @@ PluginComponent {
                 active: root.popoutMode === "menu"
                 visible: active
                 width: parent.width
-                sourceComponent: MenuView { onDismissRequested: popout.closePopout && popout.closePopout() }
+                sourceComponent: MenuView {
+                    onDismissRequested: popout.closePopout && popout.closePopout()
+                    onHistoryRequested: root.openHistory()
+                }
             }
 
             // ---------------- Package-detail view ----------------
@@ -3104,7 +4036,10 @@ PluginComponent {
                 active: root.popoutMode === "history"
                 visible: active
                 width: parent.width
-                sourceComponent: HistoryView {}
+                sourceComponent: HistoryView {
+                    onBackRequested: root.openMode("menu")
+                    onFailureActivated: entry => root.openFailureDetail(entry)
+                }
             }
 
             // ---------------- Failure detail ----------------
@@ -3112,7 +4047,10 @@ PluginComponent {
                 active: root.popoutMode === "faildetail"
                 visible: active
                 width: parent.width
-                sourceComponent: FailDetailView {}
+                sourceComponent: FailDetailView {
+                    onBackRequested: root.closeFailureDetail()
+                    onDismissRequested: popout.closePopout && popout.closePopout()
+                }
             }
 
             component HeldView: Column {
@@ -3208,517 +4146,6 @@ PluginComponent {
                 }
             }
 
-            // ---------------- Update history ----------------
-            component HistoryView: Column {
-                id: hyv
-                readonly property real contentWidth: width - leftPadding - rightPadding
-                width: parent ? parent.width : 0
-                padding: root.popoutPad
-                spacing: Theme.spacingM
-
-                // Text filter (matches name/version) + optional failed-only.
-                property string filterText: ""
-                property bool failedOnly: false
-                readonly property bool hasFailures: root.historyCombined.some(function (i) { return i.action === "failed"; })
-                readonly property var filteredItems: {
-                    var base = root.historyCombined;
-                    if (failedOnly)
-                        base = base.filter(function (i) { return i.action === "failed"; });
-                    if (filterText !== "")
-                        base = base.filter(function (i) { return root._matchesFilter(i, hyv.filterText); });
-                    return base;
-                }
-                // Sort: name or update date.
-                readonly property var displayItems: {
-                    var arr = filteredItems.slice();
-                    var dir = histSort.asc ? 1 : -1;
-                    var key = histSort.activeKey;
-                    arr.sort(function (a, b) {
-                        var c;
-                        if (key === "name") {
-                            c = String(a.name || "").localeCompare(String(b.name || ""));
-                            if (c === 0)
-                                c = root._stampToEpoch(a.when) - root._stampToEpoch(b.when);
-                        } else {
-                            c = root._stampToEpoch(a.when) - root._stampToEpoch(b.when);
-                        }
-                        return c * dir;
-                    });
-                    return arr;
-                }
-
-                // Header: back to menu + title + count
-                Item {
-                    width: hyv.contentWidth
-                    height: 40
-                    DankActionButton {
-                        id: histBack
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        buttonSize: 28
-                        iconName: "arrow_back"
-                        iconSize: 18
-                        iconColor: Theme.surfaceText
-                        onClicked: root.openMode("menu")
-                    }
-                    StyledText {
-                        anchors.left: histBack.right
-                        anchors.leftMargin: Theme.spacingS
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: "Update History"
-                        font.pixelSize: Theme.fontSizeLarge
-                        font.weight: Font.Medium
-                        color: Theme.surfaceText
-                    }
-                    Row {
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: Theme.spacingS
-                        StyledText {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: root.historyLoading ? "Loading…" : (hyv.displayItems.length + " entries")
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceVariantText
-                        }
-                        DankActionButton {
-                            buttonSize: 28
-                            iconName: "refresh"
-                            iconSize: 18
-                            iconColor: Theme.surfaceText
-                            onClicked: root.loadHistory()
-                        }
-                    }
-                }
-
-                // Text filter — search history by package name or version.
-                DankTextField {
-                    width: hyv.contentWidth
-                    height: 40
-                    visible: root.historyCombined.length > 0
-                    leftIconName: "search"
-                    showClearButton: true
-                    placeholderText: "Filter history…"
-                    text: hyv.filterText
-                    onTextEdited: hyv.filterText = text
-                }
-
-                // Sort selector (name / date) + failed-only filter toggle.
-                Item {
-                    width: hyv.contentWidth
-                    height: 24
-                    visible: root.historyCombined.length > 0
-                    SortChips {
-                        id: histSort
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        activeKey: "date"
-                        asc: false
-                        options: [ { key: "date", label: "Date" }, { key: "name", label: "Name" } ]
-                    }
-                    FilterChip {
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        visible: hyv.hasFailures
-                        label: "Failed only"
-                        icon: "error"
-                        activeColor: Theme.error
-                        active: hyv.failedOnly
-                        onToggled: hyv.failedOnly = !hyv.failedOnly
-                    }
-                }
-
-                Rectangle {
-                    width: hyv.contentWidth
-                    height: Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
-                    radius: Theme.cornerRadius
-                    color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
-
-                    StyledText {
-                        anchors.centerIn: parent
-                        width: parent.width - Theme.spacingL * 2
-                        horizontalAlignment: Text.AlignHCenter
-                        wrapMode: Text.WordWrap
-                        visible: !root.historyLoading && hyv.displayItems.length === 0
-                        text: {
-                            if (root.historyCombined.length === 0)
-                                return "No update history found in the package log.";
-                            if (hyv.failedOnly && hyv.filterText === "")
-                                return "No failed updates recorded.";
-                            return "No history entries match \"" + hyv.filterText + "\"";
-                        }
-                        color: Theme.surfaceText
-                        font.pixelSize: Theme.fontSizeMedium
-                    }
-
-                    DankListView {
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingS
-                        visible: hyv.displayItems.length > 0
-                        clip: true
-                        spacing: Theme.spacingXS
-                        model: hyv.displayItems
-
-                        delegate: Rectangle {
-                            required property var modelData
-                            readonly property bool isFailed: modelData.action === "failed"
-                            readonly property bool isDowngrade: modelData.action === "downgraded"
-                            // Accent color per row kind: failed → error, downgrade
-                            // → warning, upgrade → primary.
-                            readonly property color accent: isFailed ? Theme.error : (isDowngrade ? Theme.warning : Theme.primary)
-                            width: ListView.view ? ListView.view.width : 0
-                            height: root.detailRowHeight
-                            radius: Theme.cornerRadius
-                            color: histHover.containsMouse ? Theme.primaryHoverLight
-                                : (isFailed ? Theme.withAlpha(Theme.error, 0.08) : "transparent")
-                            Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
-                            // Failed rows open a detail view (reason + captured
-                            // log); successful rows are informational only.
-                            MouseArea {
-                                id: histHover
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                cursorShape: isFailed ? Qt.PointingHandCursor : Qt.ArrowCursor
-                                acceptedButtons: isFailed ? Qt.LeftButton : Qt.NoButton
-                                onClicked: {
-                                    if (isFailed)
-                                        root.openFailureDetail(modelData);
-                                }
-                            }
-
-                            Row {
-                                anchors.fill: parent
-                                anchors.margins: Theme.spacingM
-                                spacing: Theme.spacingM
-
-                                Rectangle {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: 24
-                                    height: 24
-                                    radius: 12
-                                    color: Theme.withAlpha(accent, isFailed ? 0.18 : (isDowngrade ? 0.20 : 0.15))
-                                    DankIcon {
-                                        anchors.centerIn: parent
-                                        name: isFailed ? "error" : (isDowngrade ? "arrow_downward" : "arrow_upward")
-                                        size: Theme.fontSizeSmall + 2
-                                        color: accent
-                                    }
-                                }
-
-                                Column {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: parent.width - 24 - Theme.spacingM * 2 - whenText.width - (isFailed ? chev.width + Theme.spacingM : 0)
-                                    spacing: 2
-                                    Row {
-                                        width: parent.width
-                                        spacing: Theme.spacingXS
-                                        StyledText {
-                                            width: Math.min(implicitWidth, parent.width - (failChip.visible ? failChip.width + Theme.spacingXS : 0))
-                                            text: modelData.name
-                                            font.pixelSize: Theme.fontSizeMedium
-                                            font.weight: Font.Medium
-                                            color: Theme.surfaceText
-                                            wrapMode: Text.NoWrap
-                                            maximumLineCount: 1
-                                            elide: Text.ElideRight
-                                        }
-                                        // Small "failed" chip so a failed row reads
-                                        // as a failure even at a glance.
-                                        Rectangle {
-                                            id: failChip
-                                            anchors.verticalCenter: parent.verticalCenter
-                                            visible: isFailed
-                                            width: failChipText.implicitWidth + Theme.spacingS
-                                            height: 16
-                                            radius: Theme.cornerRadius
-                                            color: Theme.withAlpha(Theme.error, 0.22)
-                                            StyledText {
-                                                id: failChipText
-                                                anchors.centerIn: parent
-                                                text: "failed"
-                                                font.pixelSize: Theme.fontSizeSmall - 2
-                                                font.weight: Font.Bold
-                                                color: Theme.error
-                                            }
-                                        }
-                                    }
-                                    StyledText {
-                                        width: parent.width
-                                        text: {
-                                            var ver = (modelData.oldVersion || "?") + "  →  " + (modelData.newVersion || "?");
-                                            if (isFailed) {
-                                                var hasVer = (modelData.oldVersion || "") !== "" || (modelData.newVersion || "") !== "";
-                                                return (modelData.reason || "Failed") + (hasVer ? "  ·  " + ver : "");
-                                            }
-                                            return ver;
-                                        }
-                                        font.pixelSize: Theme.fontSizeSmall
-                                        color: accent
-                                        wrapMode: Text.NoWrap
-                                        maximumLineCount: 1
-                                        elide: Text.ElideRight
-                                    }
-                                }
-
-                                StyledText {
-                                    id: whenText
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: root._fmtHistoryWhen(modelData.when)
-                                    font.pixelSize: Theme.fontSizeSmall
-                                    color: Theme.surfaceVariantText
-                                }
-
-                                // Click affordance — only failed rows are clickable.
-                                DankIcon {
-                                    id: chev
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    visible: isFailed
-                                    name: "chevron_right"
-                                    size: Theme.iconSize - 4
-                                    color: Theme.error
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Detail for a single failed update: reason, attempted version,
-            // source, full timestamp, and the captured log tail (if saved).
-            component FailDetailView: Column {
-                id: fdv
-                readonly property real contentWidth: width - leftPadding - rightPadding
-                width: parent ? parent.width : 0
-                padding: root.popoutPad
-                spacing: Theme.spacingM
-
-                readonly property var entry: root.failureDetail || ({})
-                readonly property string logText: entry && entry.log ? entry.log : ""
-                readonly property bool hasVersions: (entry.oldVersion || "") !== "" || (entry.newVersion || "") !== ""
-                readonly property var fields: {
-                    var f = [{ label: "Reason", value: entry.reason || "Failed", err: true }];
-                    if (entry.source)
-                        f.push({ label: "Source", value: entry.source, err: false });
-                    if (hasVersions)
-                        f.push({ label: "Attempted", value: (entry.oldVersion || "?") + "  →  " + (entry.newVersion || "?"), err: false });
-                    f.push({ label: "When", value: root._fmtHistoryWhen(entry.when || ""), err: false });
-                    if (entry.reason === root.reasonPkgbuildDiff)
-                        f.push({ label: "Fix", value: "The package's PKGBUILD changed, so Shelly refused to build it non-interactively. Run \"shelly aur update " + (entry.name || "<pkg>") + "\" in a terminal, review the diff, and accept it — updates from here will work again afterwards.", err: false });
-                    if (entry.reason === root.reasonDepConflict)
-                        f.push({ label: "Fix", value: "An upgrade needs a newer shared library (soname) than a held or AUR package provides — held packages aren't upgraded but still block resolution, so the whole transaction is refused. This usually means a package group must be rebuilt together against the new library (e.g. the hypr* -git stack after a libhyprutils soname bump): rebuild the whole group in one go, then run the update again. See the \"breaks dependency …\" lines in the log below for the exact library and packages involved.", err: false });
-                    return f;
-                }
-
-                // Header: back to history + name + "failed" chip
-                Item {
-                    width: fdv.contentWidth
-                    height: 40
-                    DankActionButton {
-                        id: fdBack
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        buttonSize: 28
-                        iconName: "arrow_back"
-                        iconSize: 18
-                        iconColor: Theme.surfaceText
-                        onClicked: root.closeFailureDetail()
-                    }
-                    StyledText {
-                        anchors.left: fdBack.right
-                        anchors.leftMargin: Theme.spacingS
-                        anchors.right: fdChip.left
-                        anchors.rightMargin: Theme.spacingS
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: fdv.entry.name || ""
-                        font.pixelSize: Theme.fontSizeLarge
-                        font.weight: Font.Medium
-                        color: Theme.surfaceText
-                        elide: Text.ElideRight
-                    }
-                    Rectangle {
-                        id: fdChip
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: 52
-                        height: 20
-                        radius: Theme.cornerRadius
-                        color: Theme.withAlpha(Theme.error, 0.22)
-                        StyledText {
-                            anchors.centerIn: parent
-                            text: "failed"
-                            font.pixelSize: Theme.fontSizeSmall - 1
-                            font.weight: Font.Bold
-                            color: Theme.error
-                        }
-                    }
-                }
-
-                // Structured fields
-                Column {
-                    width: fdv.contentWidth
-                    spacing: Theme.spacingXS
-                    Repeater {
-                        model: fdv.fields
-                        delegate: Row {
-                            required property var modelData
-                            width: fdv.contentWidth
-                            spacing: Theme.spacingM
-                            StyledText {
-                                width: 96
-                                text: modelData.label
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.surfaceVariantText
-                            }
-                            StyledText {
-                                width: parent.width - 96 - Theme.spacingM
-                                text: modelData.value
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: modelData.err ? Theme.error : Theme.surfaceText
-                                wrapMode: Text.WrapAnywhere
-                            }
-                        }
-                    }
-                }
-
-                // ---- AI failure analysis ----
-                readonly property string aiText: (entry && entry.ai) ? entry.ai : ""
-
-                DetailActionButton {
-                    width: fdv.contentWidth
-                    visible: root.aiReady && fdv.aiText === "" && !root.aiLoading
-                    icon: "neurology"
-                    label: "Suggest fix with AI"
-                    onTriggered: root.requestAiSuggestion()
-                }
-                // In-flight indicator (click to cancel).
-                Rectangle {
-                    width: fdv.contentWidth
-                    visible: root.aiLoading
-                    height: visible ? 40 : 0
-                    radius: Theme.cornerRadius
-                    color: Theme.secondaryHover
-                    Row {
-                        anchors.centerIn: parent
-                        spacing: Theme.spacingS
-                        DankIcon {
-                            id: aiSpinner
-                            anchors.verticalCenter: parent.verticalCenter
-                            name: "progress_activity"
-                            size: Theme.iconSize - 2
-                            color: Theme.primary
-                            RotationAnimation on rotation {
-                                from: 0; to: 360; duration: 1000
-                                loops: Animation.Infinite; running: root.aiLoading
-                                onRunningChanged: { if (!running) aiSpinner.rotation = 0; }
-                            }
-                        }
-                        StyledText {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: "Asking the AI… (click to cancel)"
-                            font.pixelSize: Theme.fontSizeMedium
-                            color: Theme.surfaceText
-                        }
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: root.cancelAiSuggestion()
-                    }
-                }
-                StyledText {
-                    width: fdv.contentWidth
-                    visible: root.aiError !== "" && !root.aiLoading
-                    text: root.aiError
-                    font.pixelSize: Theme.fontSizeSmall
-                    color: Theme.error
-                    wrapMode: Text.WordWrap
-                }
-                StyledText {
-                    width: fdv.contentWidth
-                    visible: fdv.aiText !== ""
-                    text: "AI suggestion"
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.weight: Font.Medium
-                    color: Theme.surfaceVariantText
-                }
-                Rectangle {
-                    width: fdv.contentWidth
-                    visible: fdv.aiText !== ""
-                    height: visible ? Math.min(aiAnswer.implicitHeight + Theme.spacingM * 2,
-                                               Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS))) : 0
-                    radius: Theme.cornerRadius
-                    color: Theme.withAlpha(Theme.primary, 0.08)
-                    border.width: 1
-                    border.color: Theme.withAlpha(Theme.primary, 0.25)
-
-                    Flickable {
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingM
-                        clip: true
-                        contentHeight: aiAnswer.implicitHeight
-                        contentWidth: width
-                        boundsBehavior: Flickable.StopAtBounds
-                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-                        StyledText {
-                            id: aiAnswer
-                            width: parent.width
-                            text: fdv.aiText
-                            font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.surfaceText
-                            wrapMode: Text.WordWrap
-                        }
-                    }
-                }
-
-                // Captured log tail
-                StyledText {
-                    width: fdv.contentWidth
-                    text: fdv.logText !== "" ? "Log (tail of the failed run)" : "No log was saved for this failure."
-                    font.pixelSize: Theme.fontSizeSmall
-                    font.weight: Font.Medium
-                    color: Theme.surfaceVariantText
-                }
-                Rectangle {
-                    width: fdv.contentWidth
-                    visible: fdv.logText !== ""
-                    height: Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
-                    radius: Theme.cornerRadius
-                    color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
-
-                    Flickable {
-                        id: logFlick
-                        anchors.fill: parent
-                        anchors.margins: Theme.spacingM
-                        clip: true
-                        contentHeight: logCol.height
-                        contentWidth: width
-                        boundsBehavior: Flickable.StopAtBounds
-                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-
-                        Column {
-                            id: logCol
-                            width: logFlick.width
-                            StyledText {
-                                width: parent.width
-                                text: fdv.logText
-                                font.family: Theme.monoFontFamily
-                                font.pixelSize: Theme.fontSizeSmall - 1
-                                color: Theme.surfaceText
-                                wrapMode: Text.WrapAnywhere
-                            }
-                        }
-                    }
-                }
-
-                // Open the full live log — only meaningful for the most recent
-                // run (older runs' logs are gone; we only kept the excerpt).
-                DetailActionButton {
-                    width: fdv.contentWidth
-                    visible: root._isFailed(fdv.entry.name)
-                    icon: "description"
-                    label: "View full log"
-                    onTriggered: root.viewLastLog()
-                }
-            }
         }
     }
 }
