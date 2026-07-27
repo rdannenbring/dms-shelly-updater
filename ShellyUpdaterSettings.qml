@@ -866,6 +866,9 @@ PluginSettings {
                 "",
                 "Briefly explain what went wrong, then give concrete numbered fix steps the user can run.",
                 "Put each runnable shell command on its own line, prefixed with \"$ \" (dollar + space) and nothing else on that line, so it can be copied and run directly.",
+                "Prefer non-interactive command forms so they run inline without prompts (the app runs \"$ \" commands with no terminal, so a command that waits for input just fails).",
+                "If a command truly needs a terminal — it asks for a sudo password, or a confirmation/review the user must see (e.g. an AUR PKGBUILD review, or a pacman/yay install confirmation) — prefix it with \"$! \" (dollar + bang + space) instead of \"$ \", so the app opens a terminal for it.",
+                "End with a short \"Verify:\" step — a \"$ \"-prefixed command whose output shows whether the fix worked — so the result can be checked afterwards.",
                 "Plain text only — no markdown syntax. Keep it under 200 words."
             ].join("\n")
             property bool isInitialized: false

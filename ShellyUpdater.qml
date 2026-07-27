@@ -117,6 +117,9 @@ PluginComponent {
         "",
         "Briefly explain what went wrong, then give concrete numbered fix steps the user can run.",
         "Put each runnable shell command on its own line, prefixed with \"$ \" (dollar + space) and nothing else on that line, so it can be copied and run directly.",
+        "Prefer non-interactive command forms so they run inline without prompts (the app runs \"$ \" commands with no terminal, so a command that waits for input just fails).",
+        "If a command truly needs a terminal — it asks for a sudo password, or a confirmation/review the user must see (e.g. an AUR PKGBUILD review, or a pacman/yay install confirmation) — prefix it with \"$! \" (dollar + bang + space) instead of \"$ \", so the app opens a terminal for it.",
+        "End with a short \"Verify:\" step — a \"$ \"-prefixed command whose output shows whether the fix worked — so the result can be checked afterwards.",
         "Plain text only — no markdown syntax. Keep it under 200 words."
     ].join("\n")
     readonly property string aiPromptTemplate: (_pd.aiPromptTemplate || "").trim() !== "" ? _pd.aiPromptTemplate : aiPromptDefault
@@ -361,6 +364,7 @@ PluginComponent {
                     if (o.ai !== undefined) patches[k].ai = o.ai;
                     if (o.resolved !== undefined) patches[k].resolved = o.resolved;
                     if (o.dismissed !== undefined) patches[k].dismissed = o.dismissed;
+                    if (o.aiChat !== undefined) patches[k].aiChat = o.aiChat;
                 }
                 var list = root.failureHistory.slice();
                 var changed = false;
@@ -374,6 +378,11 @@ PluginComponent {
                             upd[fld] = p[fld];
                         }
                     });
+                    // aiChat is an array → compare by value to avoid churn.
+                    if (p.aiChat !== undefined && JSON.stringify(list[j].aiChat) !== JSON.stringify(p.aiChat)) {
+                        if (!upd) upd = JSON.parse(JSON.stringify(list[j]));
+                        upd.aiChat = p.aiChat;
+                    }
                     if (upd) { list[j] = upd; changed = true; }
                 }
                 if (changed)
@@ -1631,6 +1640,10 @@ PluginComponent {
     property string aiError: ""
     property string _aiStdout: ""
     property string _aiStderr: ""
+    // Conversation state: "initial" = first suggestion (saved to entry.ai),
+    // "followup" = a Check-result/free follow-up (appended to entry.aiChat).
+    property string _aiMode: "initial"
+    property string _aiPendingUser: "" // the user turn awaiting this run's reply
 
     // Fill the template. split/join instead of String.replace so log content
     // containing "$&"-style sequences can't corrupt the substitution.
@@ -1670,15 +1683,54 @@ PluginComponent {
         }
     }
 
-    function requestAiSuggestion() {
-        if (!aiReady || aiLoading || !root.failureDetail)
-            return;
+    function _runAi(promptText) {
         root.aiError = "";
         root._aiStdout = "";
         root._aiStderr = "";
         root.aiLoading = true;
-        aiProc.command = ["sh", "-c", "printf '%s' \"$1\" | ( " + aiCommand + " )", "shelly-ai", _aiPrompt(root.failureDetail)];
+        aiProc.command = ["sh", "-c", "printf '%s' \"$1\" | ( " + aiCommand + " )", "shelly-ai", promptText];
         aiProc.running = true;
+    }
+    function requestAiSuggestion() {
+        if (!aiReady || aiLoading || !root.failureDetail)
+            return;
+        root._aiMode = "initial";
+        root._aiPendingUser = "";
+        _runAi(_aiPrompt(root.failureDetail));
+    }
+    // Assemble the conversation so far as plain text, so any configured CLI can
+    // continue it (we don't rely on a tool-specific --continue/session flag).
+    function _conversationText(entry) {
+        var lines = [];
+        if (entry.ai)
+            lines.push("Assistant (your earlier suggestion):\n" + entry.ai);
+        var chat = entry.aiChat || [];
+        for (var i = 0; i < chat.length; i++)
+            lines.push((chat[i].role === "user" ? "User:\n" : "Assistant:\n") + chat[i].content);
+        return lines.join("\n\n");
+    }
+    // Send a follow-up turn (free text or the Check-result canned message). The
+    // latest inline command output is attached so the AI can see what happened.
+    function _sendAiTurn(userMsg) {
+        var e = root.failureDetail;
+        if (!aiReady || aiLoading || !e || !userMsg || !userMsg.trim())
+            return;
+        var p = _aiPrompt(e)
+            + "\n\n=== Conversation so far ===\n" + _conversationText(e)
+            + "\n\n=== The user now says ===\n" + userMsg;
+        if (root.aiRunOutput && root.aiRunOutput.trim() !== "")
+            p += "\n\nOutput of the command(s) the user just ran (`" + root.aiRunCmd + "`):\n" + root.aiRunOutput;
+        p += "\n\nReply concisely, continuing to use \"$ \"-prefixed lines for any runnable commands. "
+            + "If the problem now looks resolved, say so plainly.";
+        root._aiMode = "followup";
+        root._aiPendingUser = userMsg;
+        _runAi(p);
+    }
+    function sendAiFollowup(userMsg) {
+        _sendAiTurn(userMsg);
+    }
+    function checkAiResult() {
+        _sendAiTurn("I applied your steps. Using the command output above (if any) and the current package state, tell me whether the failure is resolved. If it isn't, give corrected next steps.");
     }
     function cancelAiSuggestion() {
         if (aiProc.running)
@@ -1709,7 +1761,39 @@ PluginComponent {
         }
         if (out.length > 6000)
             out = out.slice(0, 6000) + " …";
-        _saveAiResult(out);
+        if (root._aiMode === "followup")
+            _appendAiChat(root._aiPendingUser, out);
+        else
+            _saveAiResult(out);
+        root._aiPendingUser = "";
+    }
+    // Append a user turn + the assistant reply to the failure's conversation,
+    // persisting the whole transcript (sidecar + pluginService).
+    function _appendAiChat(userMsg, assistantMsg) {
+        var e = root.failureDetail;
+        if (!e)
+            return;
+        var list = root.failureHistory.slice();
+        var updEntry = null;
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].name === e.name && list[i].when === e.when) {
+                var upd = JSON.parse(JSON.stringify(list[i]));
+                var chat = (upd.aiChat || []).slice();
+                chat.push({ role: "user", content: userMsg });
+                chat.push({ role: "assistant", content: assistantMsg });
+                upd.aiChat = chat;
+                list[i] = upd;
+                updEntry = upd;
+                break;
+            }
+        }
+        if (!updEntry)
+            return;
+        root.failureHistory = list;
+        root.failureDetail = updEntry;
+        if (pluginService && pluginService.savePluginState)
+            pluginService.savePluginState(pluginId, "failureHistory", JSON.stringify(root.failureHistory));
+        _writeFailurePatch(updEntry.name, updEntry.when, { aiChat: updEntry.aiChat });
     }
     // Attach the answer to the failure record so it survives view changes and
     // restarts, and shows on every monitor.
@@ -1734,6 +1818,33 @@ PluginComponent {
         // center (no pluginService) survives a reopen.
         _writeFailurePatch(e.name, e.when, { ai: answer });
     }
+    // Wipe the AI conversation for a failure (suggestion + all follow-ups). The
+    // failure itself stays; only the AI history is cleared.
+    function clearAiConversation() {
+        var e = root.failureDetail;
+        if (!e)
+            return;
+        var list = root.failureHistory.slice();
+        var updEntry = null;
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].name === e.name && list[i].when === e.when) {
+                var upd = JSON.parse(JSON.stringify(list[i]));
+                upd.ai = "";
+                upd.aiChat = [];
+                list[i] = upd;
+                updEntry = upd;
+                break;
+            }
+        }
+        if (!updEntry)
+            return;
+        root.aiError = "";
+        root.failureHistory = list;
+        root.failureDetail = updEntry;
+        if (pluginService && pluginService.savePluginState)
+            pluginService.savePluginState(pluginId, "failureHistory", JSON.stringify(root.failureHistory));
+        _writeFailurePatch(updEntry.name, updEntry.when, { ai: "", aiChat: [] });
+    }
 
     // Split an AI answer into ordered segments: prose text blocks and runnable
     // commands (lines the prompt asked the model to prefix with "$ "). Each
@@ -1749,16 +1860,51 @@ PluginComponent {
         }
         var lines = String(text || "").split("\n");
         for (var i = 0; i < lines.length; i++) {
-            var m = /^\s*\$\s+(\S.*?)\s*$/.exec(lines[i]);
-            if (m) {
+            var mi = /^\s*\$!\s+(\S.*?)\s*$/.exec(lines[i]); // "$! " → needs a terminal
+            var m = /^\s*\$\s+(\S.*?)\s*$/.exec(lines[i]);   // "$ "  → runs inline
+            if (mi) {
                 flush();
-                out.push({ cmd: true, value: m[1] });
+                out.push({ cmd: true, interactive: true, value: mi[1] });
+            } else if (m) {
+                flush();
+                out.push({ cmd: true, interactive: false, value: m[1] });
             } else {
                 buf.push(lines[i]);
             }
         }
         flush();
         return out;
+    }
+    // Flatten a failure's whole AI conversation into render segments: the first
+    // suggestion + each follow-up turn. Assistant text/commands become
+    // text/cmd segments; user turns become { user: true } bubbles.
+    function _aiConversationSegments(entry) {
+        var segs = [];
+        if (entry && entry.ai)
+            _aiSegments(entry.ai).forEach(function (s) { segs.push(s); });
+        var chat = (entry && entry.aiChat) || [];
+        for (var i = 0; i < chat.length; i++) {
+            if (chat[i].role === "user")
+                segs.push({ user: true, value: chat[i].content });
+            else
+                _aiSegments(chat[i].content).forEach(function (s) { segs.push(s); });
+        }
+        return segs;
+    }
+    // Grouped by turn (for chat bubbles): assistant turns carry parsed segments
+    // (text + $ commands); user turns carry raw text.
+    function _aiConversationTurns(entry) {
+        var turns = [];
+        if (entry && entry.ai)
+            turns.push({ role: "assistant", segments: _aiSegments(entry.ai) });
+        var chat = (entry && entry.aiChat) || [];
+        for (var i = 0; i < chat.length; i++) {
+            if (chat[i].role === "user")
+                turns.push({ role: "user", text: chat[i].content });
+            else
+                turns.push({ role: "assistant", segments: _aiSegments(chat[i].content) });
+        }
+        return turns;
     }
     // Run an AI-suggested command in a VISIBLE terminal (it may need sudo, and
     // the user should see exactly what runs and be able to abort). Held open on
@@ -1768,6 +1914,54 @@ PluginComponent {
             return;
         var inner = cmd + "; echo; echo '── Command finished ── Press Enter to close'; read _";
         Quickshell.execDetached(_launchArgv(inner));
+    }
+
+    // ---- Inline command execution (streamed output in the failure detail) ----
+    // Runs the command with stdout+stderr merged and streams it into an in-widget
+    // panel — no separate window. No TTY, so it can't answer a sudo password or
+    // interactive confirmation prompt: those fail fast (the panel shows the
+    // error) and the user falls back to the terminal button. State lives on root
+    // so output survives the popout closing mid-run.
+    property string aiRunCmd: ""
+    property string aiRunOutput: ""
+    property bool aiRunning: false
+    property bool aiRunDone: false
+    property int aiRunExit: 0
+    function runAiCommandInline(cmd) {
+        if (!cmd || !cmd.trim() || aiRunning)
+            return;
+        root.aiRunCmd = cmd;
+        root.aiRunOutput = "";
+        root.aiRunExit = 0;
+        root.aiRunDone = false;
+        root.aiRunning = true;
+        // exec </dev/null so anything that reads stdin (a pacman/yay "Proceed?"
+        // prompt, a sudo password read) gets EOF and fails fast instead of
+        // hanging forever — inline has no TTY to answer prompts. Query commands
+        // don't read stdin, so they're unaffected.
+        aiRunProc.command = ["sh", "-c", "exec </dev/null; " + cmd + " 2>&1"];
+        aiRunProc.running = true;
+    }
+    function cancelAiRun() {
+        if (aiRunProc.running)
+            aiRunProc.running = false;
+        root.aiRunning = false;
+    }
+    Process {
+        id: aiRunProc
+        stdout: SplitParser {
+            onRead: data => {
+                var s = root.aiRunOutput + data + "\n";
+                if (s.length > 40000)          // keep the panel bounded
+                    s = "…\n" + s.slice(s.length - 40000);
+                root.aiRunOutput = s;
+            }
+        }
+        onExited: (code, status) => {
+            root.aiRunExit = code;
+            root.aiRunning = false;
+            root.aiRunDone = true;
+        }
     }
 
     function openPluginSettings() {
@@ -3780,6 +3974,8 @@ PluginComponent {
         // Collapsible sections (AI open by default, the verbose log closed).
         property bool aiExpanded: true
         property bool logExpanded: false
+        property bool outputExpanded: true
+        property bool confirmingClear: false // "delete conversation?" prompt
         readonly property real contentWidth: width - leftPadding - rightPadding
         width: parent ? parent.width : 0
         padding: fdv.embedded ? 0 : root.popoutPad
@@ -3912,41 +4108,6 @@ PluginComponent {
             label: "Suggest fix with AI"
             onTriggered: root.requestAiSuggestion()
         }
-        // In-flight indicator (click to cancel).
-        Rectangle {
-            width: fdv.contentWidth
-            visible: root.aiLoading
-            height: visible ? 40 : 0
-            radius: Theme.cornerRadius
-            color: Theme.secondaryHover
-            Row {
-                anchors.centerIn: parent
-                spacing: Theme.spacingS
-                DankIcon {
-                    id: aiSpinner
-                    anchors.verticalCenter: parent.verticalCenter
-                    name: "progress_activity"
-                    size: Theme.iconSize - 2
-                    color: Theme.primary
-                    RotationAnimation on rotation {
-                        from: 0; to: 360; duration: 1000
-                        loops: Animation.Infinite; running: root.aiLoading
-                        onRunningChanged: { if (!running) aiSpinner.rotation = 0; }
-                    }
-                }
-                StyledText {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "Asking the AI… (click to cancel)"
-                    font.pixelSize: Theme.fontSizeMedium
-                    color: Theme.surfaceText
-                }
-            }
-            MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.cancelAiSuggestion()
-            }
-        }
         StyledText {
             width: fdv.contentWidth
             visible: root.aiError !== "" && !root.aiLoading
@@ -3986,24 +4147,98 @@ PluginComponent {
                     color: Theme.surfaceVariantText
                 }
             }
-            DankActionButton {
+            Row {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                buttonSize: 24
-                iconName: "refresh"
-                iconSize: 14
-                iconColor: Theme.surfaceVariantText
-                enabled: root.aiReady && !root.aiLoading
-                opacity: enabled ? 1.0 : 0.4
-                tooltipText: root.aiReady ? "Re-run the AI suggestion" : "Configure an AI command in Settings → AI"
-                onClicked: root.requestAiSuggestion()
+                spacing: 0
+                DankActionButton {
+                    buttonSize: 24
+                    iconName: "delete"
+                    iconSize: 14
+                    iconColor: Theme.surfaceVariantText
+                    enabled: !root.aiLoading
+                    opacity: enabled ? 1.0 : 0.4
+                    tooltipText: "Delete this conversation"
+                    onClicked: fdv.confirmingClear = true
+                }
+                DankActionButton {
+                    buttonSize: 24
+                    iconName: "refresh"
+                    iconSize: 14
+                    iconColor: Theme.surfaceVariantText
+                    enabled: root.aiReady && !root.aiLoading
+                    opacity: enabled ? 1.0 : 0.4
+                    tooltipText: root.aiReady ? "Re-run the AI suggestion" : "Configure an AI command in Settings → AI"
+                    onClicked: root.requestAiSuggestion()
+                }
+            }
+        }
+        // "Delete conversation?" confirmation — shown in place of the box.
+        Rectangle {
+            width: fdv.contentWidth
+            visible: fdv.aiText !== "" && fdv.confirmingClear
+            height: visible ? clearCol.implicitHeight + Theme.spacingM * 2 : 0
+            radius: Theme.cornerRadius
+            color: Theme.withAlpha(Theme.error, 0.10)
+            border.width: 1
+            border.color: Theme.withAlpha(Theme.error, 0.35)
+            Column {
+                id: clearCol
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: Theme.spacingM
+                spacing: Theme.spacingS
+                StyledText {
+                    width: parent.width
+                    text: "Delete this AI conversation? The suggestion and all follow-ups will be permanently lost."
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceText
+                    wrapMode: Text.WordWrap
+                }
+                Row {
+                    anchors.right: parent.right
+                    spacing: Theme.spacingS
+                    Rectangle {
+                        width: cancelClearText.implicitWidth + Theme.spacingM * 2
+                        height: 30
+                        radius: Theme.cornerRadius
+                        color: cancelClearHover.containsMouse ? Theme.primaryHoverLight : Theme.secondaryHover
+                        StyledText { id: cancelClearText; anchors.centerIn: parent; text: "Cancel"; font.pixelSize: Theme.fontSizeSmall; color: Theme.surfaceText }
+                        MouseArea { id: cancelClearHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: fdv.confirmingClear = false }
+                    }
+                    Rectangle {
+                        width: doClearRow.implicitWidth + Theme.spacingM * 2
+                        height: 30
+                        radius: Theme.cornerRadius
+                        color: doClearHover.containsMouse ? Theme.withAlpha(Theme.error, 0.30) : Theme.withAlpha(Theme.error, 0.18)
+                        Row {
+                            id: doClearRow
+                            anchors.centerIn: parent
+                            spacing: Theme.spacingXS
+                            DankIcon { anchors.verticalCenter: parent.verticalCenter; name: "delete"; size: Theme.iconSize - 6; color: Theme.error }
+                            StyledText { anchors.verticalCenter: parent.verticalCenter; text: "Delete"; font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Medium; color: Theme.error }
+                        }
+                        MouseArea {
+                            id: doClearHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                root.clearAiConversation();
+                                fdv.confirmingClear = false;
+                            }
+                        }
+                    }
+                }
             }
         }
         Rectangle {
             width: fdv.contentWidth
-            visible: fdv.aiText !== "" && fdv.aiExpanded
-            height: visible ? Math.min(aiCol.implicitHeight + Theme.spacingM * 2,
-                                       fdv.embedded ? 220 : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS))) : 0
+            visible: fdv.aiText !== "" && fdv.aiExpanded && !fdv.confirmingClear
+            // Full content height — the surrounding view scrolls as a whole, so
+            // the conversation isn't trapped behind a small nested scroll.
+            height: visible ? aiCol.implicitHeight + Theme.spacingM * 2 : 0
             radius: Theme.cornerRadius
             color: Theme.withAlpha(Theme.primary, 0.08)
             border.width: 1
@@ -4020,72 +4255,343 @@ PluginComponent {
                 Column {
                     id: aiCol
                     width: parent.width
-                    spacing: Theme.spacingXS
+                    spacing: Theme.spacingS
                     Repeater {
-                        // Prose blocks render as text; "$ " command lines render
-                        // as a mono row with copy + run buttons.
-                        model: root._aiSegments(fdv.aiText)
+                        // One bubble per conversation turn: AI on the left,
+                        // the user's follow-ups on the right.
+                        model: root._aiConversationTurns(fdv.entry)
                         delegate: Item {
                             required property var modelData
+                            readonly property bool isUser: modelData.role === "user"
                             width: aiCol.width
-                            implicitHeight: modelData.cmd ? cmdRow.height : txtBlock.implicitHeight
-                            StyledText {
-                                id: txtBlock
-                                visible: !modelData.cmd
-                                width: parent.width
-                                text: modelData.value
-                                font.pixelSize: Theme.fontSizeSmall
-                                color: Theme.surfaceText
-                                wrapMode: Text.WordWrap
-                            }
+                            implicitHeight: bubble.height
                             Rectangle {
-                                id: cmdRow
-                                visible: modelData.cmd
-                                width: parent.width
-                                height: visible ? Math.max(30, cmdText.implicitHeight + Theme.spacingXS * 2) : 0
+                                id: bubble
+                                width: aiCol.width * 0.9
+                                x: isUser ? (aiCol.width - width) : 0
+                                height: bubbleCol.implicitHeight + Theme.spacingS * 2
                                 radius: Theme.cornerRadius
-                                color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.3)
-                                StyledText {
-                                    id: cmdText
-                                    anchors.left: parent.left
-                                    anchors.leftMargin: Theme.spacingS
-                                    anchors.right: cmdBtns.left
-                                    anchors.rightMargin: Theme.spacingXS
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: modelData.value
-                                    font.family: Theme.monoFontFamily
-                                    font.pixelSize: Theme.fontSizeSmall - 1
-                                    color: Theme.primary
-                                    wrapMode: Text.WrapAnywhere
-                                }
-                                Row {
-                                    id: cmdBtns
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: Theme.spacingXS
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    spacing: 0
-                                    DankActionButton {
-                                        buttonSize: 26
-                                        iconName: "content_copy"
-                                        iconSize: 14
-                                        iconColor: Theme.surfaceVariantText
-                                        tooltipText: "Copy"
-                                        onClicked: Quickshell.execDetached(["dms", "cl", "copy", modelData.value])
+                                color: isUser ? Theme.withAlpha(Theme.secondary, 0.16)
+                                              : Theme.withAlpha(Theme.primary, 0.10)
+                                Column {
+                                    id: bubbleCol
+                                    x: Theme.spacingS
+                                    y: Theme.spacingS
+                                    width: bubble.width - Theme.spacingS * 2
+                                    spacing: Theme.spacingXS
+                                    // User turn: plain text.
+                                    StyledText {
+                                        visible: isUser
+                                        width: parent.width
+                                        text: modelData.text || ""
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.surfaceText
+                                        wrapMode: Text.WordWrap
                                     }
-                                    DankActionButton {
-                                        buttonSize: 26
-                                        iconName: "play_arrow"
-                                        iconSize: 16
-                                        iconColor: Theme.primary
-                                        tooltipText: "Run in a terminal"
-                                        onClicked: {
-                                            root.runAiCommand(modelData.value);
-                                            fdv.dismissRequested(); // close so focus goes to the terminal
+                                    // Assistant turn: prose blocks + "$ " command
+                                    // rows with copy/run buttons.
+                                    Repeater {
+                                        model: isUser ? [] : modelData.segments
+                                        delegate: Item {
+                                            required property var modelData
+                                            readonly property bool interactive: modelData.interactive === true
+                                            width: bubbleCol.width
+                                            implicitHeight: modelData.cmd
+                                                ? (cmdRow.height + (interactive ? interactiveHint.height + 2 : 0))
+                                                : txtBlock.implicitHeight
+                                            StyledText {
+                                                id: txtBlock
+                                                visible: !modelData.cmd
+                                                width: parent.width
+                                                text: modelData.value
+                                                font.pixelSize: Theme.fontSizeSmall
+                                                color: Theme.surfaceText
+                                                wrapMode: Text.WordWrap
+                                            }
+                                            // "Needs a terminal" hint under an interactive command.
+                                            Row {
+                                                id: interactiveHint
+                                                visible: modelData.cmd && parent.interactive
+                                                y: cmdRow.height + 2
+                                                x: Theme.spacingS
+                                                height: visible ? intHintText.implicitHeight : 0
+                                                spacing: 3
+                                                DankIcon {
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    name: "terminal"
+                                                    size: Theme.fontSizeSmall
+                                                    color: Theme.warning
+                                                }
+                                                StyledText {
+                                                    id: intHintText
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    text: "Interactive — opens a terminal (can't run inline)"
+                                                    font.pixelSize: Theme.fontSizeSmall - 2
+                                                    color: Theme.warning
+                                                }
+                                            }
+                                            Rectangle {
+                                                id: cmdRow
+                                                visible: modelData.cmd
+                                                width: parent.width
+                                                height: visible ? Math.max(30, cmdText.implicitHeight + Theme.spacingXS * 2) : 0
+                                                radius: Theme.cornerRadius
+                                                color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.35)
+                                                StyledText {
+                                                    id: cmdText
+                                                    anchors.left: parent.left
+                                                    anchors.leftMargin: Theme.spacingS
+                                                    anchors.right: cmdBtns.left
+                                                    anchors.rightMargin: Theme.spacingXS
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    text: modelData.value
+                                                    font.family: Theme.monoFontFamily
+                                                    font.pixelSize: Theme.fontSizeSmall - 1
+                                                    color: Theme.primary
+                                                    wrapMode: Text.Wrap
+                                                }
+                                                Row {
+                                                    id: cmdBtns
+                                                    anchors.right: parent.right
+                                                    anchors.rightMargin: Theme.spacingXS
+                                                    anchors.verticalCenter: parent.verticalCenter
+                                                    spacing: 0
+                                                    DankActionButton {
+                                                        buttonSize: 26
+                                                        iconName: "content_copy"
+                                                        iconSize: 14
+                                                        iconColor: Theme.surfaceVariantText
+                                                        tooltipText: "Copy"
+                                                        onClicked: Quickshell.execDetached(["dms", "cl", "copy", modelData.value])
+                                                    }
+                                                    // Inline run — hidden for commands the AI
+                                                    // flagged interactive ("$! "), which need a TTY.
+                                                    DankActionButton {
+                                                        visible: !modelData.interactive
+                                                        buttonSize: 26
+                                                        iconName: "play_arrow"
+                                                        iconSize: 16
+                                                        iconColor: Theme.primary
+                                                        enabled: !root.aiRunning
+                                                        opacity: enabled ? 1.0 : 0.4
+                                                        tooltipText: "Run here (output shown below)"
+                                                        onClicked: {
+                                                            fdv.outputExpanded = true;
+                                                            root.runAiCommandInline(modelData.value);
+                                                        }
+                                                    }
+                                                    DankActionButton {
+                                                        buttonSize: 26
+                                                        iconName: "open_in_new"
+                                                        iconSize: 15
+                                                        // Emphasised (primary) for interactive commands —
+                                                        // the terminal is the intended way to run them.
+                                                        iconColor: modelData.interactive ? Theme.primary : Theme.surfaceVariantText
+                                                        tooltipText: modelData.interactive ? "Needs a terminal — run here" : "Run in a terminal window"
+                                                        onClicked: {
+                                                            root.runAiCommand(modelData.value);
+                                                            fdv.dismissRequested();
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // In-flight indicator (click to cancel) — placed below the conversation
+        // so a follow-up's "Asking the AI…" flows under the existing chat.
+        Rectangle {
+            width: fdv.contentWidth
+            visible: root.aiLoading
+            height: visible ? 40 : 0
+            radius: Theme.cornerRadius
+            color: Theme.secondaryHover
+            Row {
+                anchors.centerIn: parent
+                spacing: Theme.spacingS
+                DankIcon {
+                    id: aiSpinner
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "progress_activity"
+                    size: Theme.iconSize - 2
+                    color: Theme.primary
+                    RotationAnimation on rotation {
+                        from: 0; to: 360; duration: 1000
+                        loops: Animation.Infinite; running: root.aiLoading
+                        onRunningChanged: { if (!running) aiSpinner.rotation = 0; }
+                    }
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Asking the AI… (click to cancel)"
+                    font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.surfaceText
+                }
+            }
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.cancelAiSuggestion()
+            }
+        }
+
+        // Continue the conversation: Check-result verifies the fix (auto-feeding
+        // the last inline command output), and the input sends a free follow-up.
+        // Both carry the full transcript so the AI has the original context.
+        Column {
+            width: fdv.contentWidth
+            visible: fdv.aiText !== "" && fdv.aiExpanded && !fdv.confirmingClear
+            spacing: Theme.spacingXS
+            DetailActionButton {
+                width: fdv.contentWidth
+                btnEnabled: root.aiReady && !root.aiLoading
+                icon: "fact_check"
+                label: "Check whether it worked"
+                onTriggered: root.checkAiResult()
+            }
+            Row {
+                width: parent.width
+                spacing: Theme.spacingXS
+                DankTextField {
+                    id: followupField
+                    width: parent.width - followupSend.width - Theme.spacingXS
+                    height: 36
+                    placeholderText: "Ask a follow-up…"
+                    enabled: root.aiReady && !root.aiLoading
+                    onAccepted: {
+                        if (text.trim() !== "") {
+                            root.sendAiFollowup(text);
+                            text = "";
+                        }
+                    }
+                }
+                DankActionButton {
+                    id: followupSend
+                    buttonSize: 34
+                    iconName: "send"
+                    iconSize: 16
+                    iconColor: Theme.primary
+                    enabled: root.aiReady && !root.aiLoading && followupField.text.trim() !== ""
+                    opacity: enabled ? 1.0 : 0.4
+                    tooltipText: "Send follow-up"
+                    onClicked: {
+                        root.sendAiFollowup(followupField.text);
+                        followupField.text = "";
+                    }
+                }
+            }
+        }
+
+        // ---- Inline command output (from the "Run here" button) ----
+        Item {
+            width: fdv.contentWidth
+            visible: root.aiRunCmd !== ""
+            height: visible ? 28 : 0
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: fdv.outputExpanded = !fdv.outputExpanded
+            }
+            Row {
+                anchors.left: parent.left
+                anchors.right: outCancel.left
+                anchors.rightMargin: Theme.spacingXS
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingXS
+                DankIcon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: fdv.outputExpanded ? "expand_more" : "chevron_right"
+                    size: Theme.iconSize - 6
+                    color: Theme.surfaceVariantText
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Command output"
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: Theme.surfaceVariantText
+                }
+                DankIcon {
+                    id: outSpinner
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: root.aiRunning
+                    name: "progress_activity"
+                    size: Theme.iconSize - 8
+                    color: Theme.primary
+                    RotationAnimation on rotation {
+                        from: 0; to: 360; duration: 1000
+                        loops: Animation.Infinite; running: root.aiRunning
+                        onRunningChanged: { if (!running) outSpinner.rotation = 0; }
+                    }
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: root.aiRunDone && !root.aiRunning
+                    text: root.aiRunExit === 0 ? "exit 0" : ("exit " + root.aiRunExit)
+                    font.pixelSize: Theme.fontSizeSmall - 1
+                    font.weight: Font.Medium
+                    color: root.aiRunExit === 0 ? Theme.primary : Theme.error
+                }
+            }
+            DankActionButton {
+                id: outCancel
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.aiRunning
+                buttonSize: 24
+                iconName: "stop"
+                iconSize: 14
+                iconColor: Theme.error
+                tooltipText: "Cancel"
+                onClicked: root.cancelAiRun()
+            }
+        }
+        Rectangle {
+            width: fdv.contentWidth
+            visible: root.aiRunCmd !== "" && fdv.outputExpanded
+            height: !visible ? 0 : (fdv.embedded
+                ? Math.max(root.detailRowHeight, fdv.embeddedBodyHeight)
+                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2)
+            radius: Theme.cornerRadius
+            color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
+
+            Flickable {
+                id: outFlick
+                anchors.fill: parent
+                anchors.margins: Theme.spacingM
+                clip: true
+                contentHeight: outCol.height
+                contentWidth: width
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                // Keep pinned to the bottom as output streams in (terminal-like).
+                onContentHeightChanged: contentY = Math.max(0, contentHeight - height)
+                Column {
+                    id: outCol
+                    width: outFlick.width
+                    StyledText {
+                        width: parent.width
+                        text: "$ " + root.aiRunCmd
+                        font.family: Theme.monoFontFamily
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.primary
+                        wrapMode: Text.WrapAnywhere
+                    }
+                    StyledText {
+                        width: parent.width
+                        visible: root.aiRunOutput !== ""
+                        text: root.aiRunOutput
+                        font.family: Theme.monoFontFamily
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.surfaceText
+                        wrapMode: Text.WrapAnywhere
                     }
                 }
             }
@@ -4124,21 +4630,16 @@ PluginComponent {
         Rectangle {
             width: fdv.contentWidth
             visible: fdv.logText !== "" && fdv.logExpanded
-            height: !visible ? 0 : (fdv.embedded
-                ? Math.max(root.detailRowHeight, fdv.embeddedBodyHeight)
-                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2)
+            // Full content height (outer view scrolls the whole detail).
+            height: !visible ? 0 : logCol.height + Theme.spacingM * 2
             radius: Theme.cornerRadius
             color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
 
-            Flickable {
+            Item {
                 id: logFlick
                 anchors.fill: parent
                 anchors.margins: Theme.spacingM
                 clip: true
-                contentHeight: logCol.height
-                contentWidth: width
-                boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
                 Column {
                     id: logCol
@@ -4264,13 +4765,29 @@ PluginComponent {
             }
 
             // ---------------- Failure detail ----------------
+            // Wrapped in a Flickable capped at the screen height so the whole
+            // detail (AI conversation + output + log) scrolls as one — the
+            // popout can't grow past the screen, so without this the bottom is
+            // unreachable.
             Loader {
                 active: root.popoutMode === "faildetail"
                 visible: active
                 width: parent.width
-                sourceComponent: FailDetailView {
-                    onBackRequested: root.closeFailureDetail()
-                    onDismissRequested: popout.closePopout && popout.closePopout()
+                sourceComponent: Flickable {
+                    readonly property real maxH: Math.max(320, (root.parentScreen ? root.parentScreen.height : Screen.height) - 160)
+                    implicitHeight: Math.min(fdItem.implicitHeight, maxH)
+                    height: implicitHeight
+                    contentHeight: fdItem.implicitHeight
+                    contentWidth: width
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    FailDetailView {
+                        id: fdItem
+                        width: parent.width
+                        onBackRequested: root.closeFailureDetail()
+                        onDismissRequested: popout.closePopout && popout.closePopout()
+                    }
                 }
             }
 
