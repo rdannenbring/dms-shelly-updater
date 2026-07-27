@@ -73,6 +73,9 @@ PluginComponent {
     readonly property bool notifyOnUpdates: _pd.notifyOnUpdates !== undefined ? _pd.notifyOnUpdates : false
     readonly property int notifyThreshold: parseInt(_pd.notifyThreshold !== undefined ? _pd.notifyThreshold : 1)
     readonly property bool notifyOnFailures: _pd.notifyOnFailures !== undefined ? _pd.notifyOnFailures : true
+    // Re-fire the failure notification on later background checks while failures
+    // remain unresolved (a persistent reminder; can be noisy → default off).
+    readonly property bool notifyFailuresRepeat: _pd.notifyFailuresRepeat !== undefined ? _pd.notifyFailuresRepeat : false
     readonly property string leftClickAction: _pd.leftClickAction || "updates" // updates | menu | ui | none
     readonly property string middleClickAction: _pd.middleClickAction || "none"
     readonly property string rightClickAction: _pd.rightClickAction || "menu"
@@ -223,10 +226,34 @@ PluginComponent {
     // a non-zero exit, so a clean run never false-flags) and keep the captured
     // session log so the user can see why. Broadcast so every monitor agrees.
     property var attemptedUpdate: []          // names submitted to the last upgrade
-    property var failedPackages: []           // names that didn't apply
-    // "The last run left failures" — drives the bar glyph, the updates-view
-    // banner, and the failure notification. Cleared when a new upgrade starts.
-    readonly property bool hasFailures: failedPackages.length > 0
+    property var failedPackages: []           // names that failed in the LAST run
+    // Persistent "unresolved failures" — the latest failure per package that is
+    // STILL pending (in the actionable list), not user-dismissed, and not marked
+    // resolved (succeeded in a later run). This drives all the failure visuals so
+    // a failure stays surfaced until it's actually dealt with, instead of only
+    // reflecting the most recent run. Auto-resolves when a package updates
+    // successfully / is uninstalled / is held (all leave allShownItems).
+    readonly property var unresolvedFailures: {
+        var shown = {};
+        var items = root.allShownItems();
+        for (var s = 0; s < items.length; s++)
+            shown[items[s].name] = true;
+        var seen = {};
+        var out = [];
+        for (var i = 0; i < root.failureHistory.length; i++) {
+            var f = root.failureHistory[i];
+            if (seen[f.name])
+                continue; // only the latest failure record per package governs
+            seen[f.name] = true;
+            if (f.dismissed || f.resolved)
+                continue;
+            if (shown[f.name])
+                out.push(f);
+        }
+        return out;
+    }
+    readonly property bool hasFailures: unresolvedFailures.length > 0
+    readonly property int failureCount: unresolvedFailures.length
     // Summary of the most recent upgrade run: { when, attempted, successful,
     // failed }. Persisted + broadcast; shown on the "Update History" menu item.
     // successful = attempted − failed (the names we submitted that then applied).
@@ -243,7 +270,7 @@ PluginComponent {
     property string _lastLogText: ""          // captured session output of last run
     function _isFailed(nameOrItem) {
         var n = (typeof nameOrItem === "string") ? nameOrItem : ((nameOrItem && nameOrItem.name) || "");
-        return root.failedPackages.indexOf(n) !== -1;
+        return root.unresolvedFailures.some(function (f) { return f.name === n; });
     }
 
     // Durable, self-kept log of failed updates. pacman.log only records
@@ -295,47 +322,59 @@ PluginComponent {
     readonly property string _statePath: (Quickshell.env("XDG_STATE_HOME")
         || (Quickshell.env("HOME") + "/.local/state"))
         + "/DankMaterialShell/plugins/shellyUpdater_state.json"
-    // AI answers are stored in a small append-only JSONL sidecar (one
-    // {name,when,ai} record per line, last-wins) rather than the main state, so
-    // they persist even when generated in the control-center instance (which has
-    // no pluginService to savePluginState with). Both instances write it via
-    // sh/printf and merge it into failureHistory on load.
+    // Per-entry patches are stored in a small append-only JSONL sidecar (one
+    // {name,when, ai?/resolved?/dismissed?} record per line) rather than the main
+    // state, so they persist even when written from the control-center instance
+    // (which has no pluginService to savePluginState with). Both instances write
+    // it via sh/printf and merge it into failureHistory on load. Fields are
+    // applied last-wins per (name,when), independently of each other, so an AI
+    // answer and a later dismiss on the same failure both stick.
     readonly property string _aiSidecarPath: (Quickshell.env("XDG_STATE_HOME")
         || (Quickshell.env("HOME") + "/.local/state"))
         + "/DankMaterialShell/plugins/shellyUpdater_ai.jsonl"
     function _mergeAiSidecar() {
         aiSidecarReadProc.running = true;
     }
+    // Append one patch record for a failure entry (CC-safe: sh/printf, value as
+    // argv so no shell escaping). patch = { ai?, resolved?, dismissed? }.
+    function _writeFailurePatch(name, when, patch) {
+        var rec = JSON.stringify(Object.assign({ name: name, when: when }, patch));
+        aiSidecarWriteProc.command = ["sh", "-c", "printf '%s\\n' \"$1\" >> \"$2\"", "shelly-ai", rec, root._aiSidecarPath];
+        aiSidecarWriteProc.running = true;
+    }
     Process {
         id: aiSidecarReadProc
         command: ["cat", root._aiSidecarPath]
         stdout: StdioCollector {
             onStreamFinished: {
-                var recs = [];
                 var lines = (text || "").split("\n");
+                // Accumulate patches per (namewhen), later fields win.
+                var patches = {};
                 for (var i = 0; i < lines.length; i++) {
                     var ln = lines[i].trim();
                     if (!ln) continue;
-                    try { recs.push(JSON.parse(ln)); } catch (e) {}
+                    var o;
+                    try { o = JSON.parse(ln); } catch (e) { continue; }
+                    if (!o || o.name === undefined) continue;
+                    var k = o.name + "" + o.when;
+                    if (!patches[k]) patches[k] = {};
+                    if (o.ai !== undefined) patches[k].ai = o.ai;
+                    if (o.resolved !== undefined) patches[k].resolved = o.resolved;
+                    if (o.dismissed !== undefined) patches[k].dismissed = o.dismissed;
                 }
-                if (recs.length === 0)
-                    return;
                 var list = root.failureHistory.slice();
                 var changed = false;
                 for (var j = 0; j < list.length; j++) {
-                    var ai; // last matching record wins
-                    for (var r = recs.length - 1; r >= 0; r--) {
-                        if (recs[r].name === list[j].name && recs[r].when === list[j].when) {
-                            ai = recs[r].ai;
-                            break;
+                    var p = patches[list[j].name + "" + list[j].when];
+                    if (!p) continue;
+                    var upd = null;
+                    ["ai", "resolved", "dismissed"].forEach(function (fld) {
+                        if (p[fld] !== undefined && list[j][fld] !== p[fld]) {
+                            if (!upd) upd = JSON.parse(JSON.stringify(list[j]));
+                            upd[fld] = p[fld];
                         }
-                    }
-                    if (ai !== undefined && list[j].ai !== ai) {
-                        var upd = JSON.parse(JSON.stringify(list[j]));
-                        upd.ai = ai;
-                        list[j] = upd;
-                        changed = true;
-                    }
+                    });
+                    if (upd) { list[j] = upd; changed = true; }
                 }
                 if (changed)
                     root.failureHistory = list;
@@ -344,6 +383,55 @@ PluginComponent {
         stderr: StdioCollector { onStreamFinished: {} }
     }
     Process { id: aiSidecarWriteProc }
+    // Latest failureHistory entry for a package (newest-first list → first hit).
+    function _latestFailure(name) {
+        for (var i = 0; i < root.failureHistory.length; i++)
+            if (root.failureHistory[i].name === name)
+                return root.failureHistory[i];
+        return null;
+    }
+    // User acknowledges a failure: mark its latest record dismissed (in memory +
+    // sidecar) so it drops out of the unresolved surfacing but stays in history.
+    function dismissFailure(name) {
+        var e = _latestFailure(name);
+        if (!e) return;
+        var list = root.failureHistory.slice();
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].name === e.name && list[i].when === e.when) {
+                var upd = JSON.parse(JSON.stringify(list[i]));
+                upd.dismissed = true;
+                list[i] = upd;
+                break;
+            }
+        }
+        root.failureHistory = list;
+        _writeFailurePatch(e.name, e.when, { dismissed: true });
+    }
+    // Mark packages that were attempted in the last run but did NOT fail as
+    // resolved — the only reliable "it succeeded" signal for -git/devel packages,
+    // which stay perpetually "pending" even after a good build.
+    function _resolveSucceeded(succeededNames) {
+        if (!succeededNames || succeededNames.length === 0) return;
+        var list = root.failureHistory.slice();
+        var changed = false;
+        for (var n = 0; n < succeededNames.length; n++) {
+            var name = succeededNames[n];
+            for (var i = 0; i < list.length; i++) {
+                if (list[i].name === name) { // latest record for this name
+                    if (!list[i].resolved) {
+                        var upd = JSON.parse(JSON.stringify(list[i]));
+                        upd.resolved = true;
+                        list[i] = upd;
+                        changed = true;
+                        _writeFailurePatch(list[i].name, list[i].when, { resolved: true });
+                    }
+                    break;
+                }
+            }
+        }
+        if (changed)
+            root.failureHistory = list;
+    }
     function _loadPersistedState() {
         _ensureSettings(); // settings fall back to the file too (CC instance)
         if (pluginService && pluginService.loadPluginState) {
@@ -649,8 +737,10 @@ PluginComponent {
                 _computeFailed();
                 _awaitingUpgradeResult = false;
             }
-            if (_bgCheck)
+            if (_bgCheck) {
                 _maybeNotify();
+                _maybeNotifyFailuresRepeat();
+            }
             return;
         }
         var job = _checkQueue.shift();
@@ -1062,6 +1152,17 @@ PluginComponent {
             : (hardFail ? "Transaction failed"
             : (root._lastUpgradeExit !== 0 ? "Update failed" : "Did not apply")));
         _recordFailures(failed, reason, clean, reasonByName);
+        // Anything we attempted that did NOT fail this run counts as succeeded —
+        // mark those resolved so a prior failure clears (esp. -git/devel, which
+        // stay perpetually pending and can't auto-resolve via the pending list).
+        var failedSet = {};
+        for (var fi = 0; fi < failed.length; fi++)
+            failedSet[failed[fi]] = true;
+        var succeeded = [];
+        for (var ci = 0; ci < root.attemptedUpdate.length; ci++)
+            if (!failedSet[root.attemptedUpdate[ci]])
+                succeeded.push(root.attemptedUpdate[ci]);
+        _resolveSucceeded(succeeded);
         // Record the run summary for the History menu label. attempted = what we
         // submitted; successful = attempted that didn't end up failed.
         var attempted = (root.attemptedUpdate || []).length;
@@ -1390,15 +1491,7 @@ PluginComponent {
     function openFailures(runAi) {
         _loadPersistedState();
         loadHistory();
-        var entry = null;
-        if (root.failedPackages.length === 1) {
-            for (var i = 0; i < root.failureHistory.length; i++) {
-                if (root.failureHistory[i].name === root.failedPackages[0]) {
-                    entry = root.failureHistory[i];
-                    break; // list is newest-first, so this is the latest record
-                }
-            }
-        }
+        var entry = root.unresolvedFailures.length === 1 ? root.unresolvedFailures[0] : null;
         if (entry) {
             openFailureDetail(entry);
             if (runAi === true && root.aiReady && !entry.ai)
@@ -1480,20 +1573,38 @@ PluginComponent {
     // cross-monitor de-dup is needed). notify-send's -A flag makes it wait and
     // print the chosen action key, letting the user jump straight from the
     // notification to the failure details (optionally with the AI breakdown).
+    function _sendFailureNotification(names, summary) {
+        if (!names || names.length === 0)
+            return;
+        var body = names.slice(0, 8).join(", ") + (names.length > 8 ? " …" : "");
+        var cmd = ["notify-send", "-a", "Shelly Updater", "-i", "dialog-error",
+                   "-A", "details=View details"];
+        if (aiReady)
+            cmd.push("-A", "ai=Explain with AI");
+        cmd.push(summary, body);
+        failNotifyProc.command = cmd;
+        failNotifyProc.running = true;
+    }
     function _notifyFailures(failed) {
         if (!notifyOnFailures || !failed || failed.length === 0)
             return;
         var summary = failed.length === 1
             ? failed[0] + " failed to update"
             : failed.length + " updates failed";
-        var names = failed.slice(0, 8).join(", ") + (failed.length > 8 ? " …" : "");
-        var cmd = ["notify-send", "-a", "Shelly Updater", "-i", "dialog-error",
-                   "-A", "details=View details"];
-        if (aiReady)
-            cmd.push("-A", "ai=Explain with AI");
-        cmd.push(summary, names);
-        failNotifyProc.command = cmd;
-        failNotifyProc.running = true;
+        _sendFailureNotification(failed, summary);
+    }
+    // Persistent reminder on background checks while failures remain unresolved.
+    function _maybeNotifyFailuresRepeat() {
+        if (!notifyOnFailures || !notifyFailuresRepeat)
+            return;
+        var uf = root.unresolvedFailures;
+        if (uf.length === 0)
+            return;
+        var names = uf.map(function (f) { return f.name; });
+        var summary = names.length === 1
+            ? names[0] + " still needs attention"
+            : names.length + " failed updates still need attention";
+        _sendFailureNotification(names, summary);
     }
     Process {
         id: failNotifyProc
@@ -1620,11 +1731,8 @@ PluginComponent {
         if (pluginService && pluginService.savePluginState)
             pluginService.savePluginState(pluginId, "failureHistory", JSON.stringify(root.failureHistory));
         // Persist to the sidecar too, so an answer generated in the control
-        // center (no pluginService) survives a reopen. Append one JSONL record;
-        // the value is passed as an argv (array form → no shell escaping).
-        var rec = JSON.stringify({ name: e.name, when: e.when, ai: answer });
-        aiSidecarWriteProc.command = ["sh", "-c", "printf '%s\\n' \"$1\" >> \"$2\"", "shelly-ai", rec, root._aiSidecarPath];
-        aiSidecarWriteProc.running = true;
+        // center (no pluginService) survives a reopen.
+        _writeFailurePatch(e.name, e.when, { ai: answer });
     }
 
     // Split an AI answer into ordered segments: prose text blocks and runnable
@@ -1941,13 +2049,21 @@ PluginComponent {
 
         // Count sits before the icon for horizontal "left" / vertical "top".
         readonly property bool countFirst: isVertical ? (root.countPositionV === "top") : (root.countPositionH === "left")
-        readonly property bool countVisible: root.showCount && root.updateCount > 0 && !root.isChecking
+        // Transient states (checking/upgrading/error) show a single status icon;
+        // otherwise the pill shows a failure indicator (red) AND/OR a pending-
+        // updates indicator so both counts are visible at once.
+        readonly property bool busyState: root.isChecking || root.isUpgrading || root.remoteUpgrading || root.hasError
+        readonly property bool showFail: !busyState && root.failureCount > 0
+        readonly property bool showUpd: !busyState && root.updateCount > 0
+        readonly property bool showIdle: !busyState && !showFail && !showUpd
+        readonly property int pillIconSize: Theme.barIconSize(root.barThickness, -4, root.barConfig?.noBackground)
 
         implicitWidth: layout.implicitWidth
         implicitHeight: layout.implicitHeight
 
-        // Positioners skip invisible children, so we declare a count on each
-        // side of the icon and show exactly one — no reparenting needed.
+        // Flat positioner: each indicator's count + icon are separate children,
+        // shown/hidden by visibility (positioners skip invisible items). Order:
+        // failure indicator first (priority), then pending updates.
         Grid {
             id: layout
             anchors.centerIn: parent
@@ -1957,53 +2073,73 @@ PluginComponent {
             horizontalItemAlignment: Grid.AlignHCenter
             verticalItemAlignment: Grid.AlignVCenter
 
-            StyledText {
-                text: String(root.updateCount)
-                font.pixelSize: Theme.fontSizeSmall
-                font.weight: Font.Medium
-                color: Theme.primary
-                visible: countVisible && countFirst
-            }
-
+            // Busy status icon (spinner / error), shown alone.
             DankIcon {
-                id: dankIcon
+                id: statusIcon
+                visible: busyState
                 name: {
-                    // "updating" takes priority so every monitor shows the SAME
-                    // glyph while an upgrade runs (local isUpgrading or the
-                    // broadcast remoteUpgrading), distinct from the check spinner.
                     if (root.isUpgrading || root.remoteUpgrading) return "sync";
                     if (root.isChecking) return "refresh";
-                    if (root.hasError) return "error";
-                    if (root.hasFailures) return root.iconFailures;
-                    return root.updateCount > 0 ? root.iconUpdates : root.iconDefault;
+                    return "error"; // hasError
                 }
-                size: Theme.barIconSize(root.barThickness, -4, root.barConfig?.noBackground)
-                color: {
-                    if (root.hasError) return Theme.error;
-                    if (root.hasFailures && !(root.isChecking || root.isUpgrading || root.remoteUpgrading)) return Theme.error;
-                    if (root.updateCount > 0 || root.isChecking || root.isUpgrading || root.remoteUpgrading) return Theme.primary;
-                    return Theme.surfaceText;
-                }
-
+                size: pillIconSize
+                color: root.hasError ? Theme.error : Theme.primary
                 RotationAnimation on rotation {
                     from: 0
                     to: 360
                     duration: 1000
                     loops: Animation.Infinite
                     running: root.isChecking || root.isUpgrading || root.remoteUpgrading
-                    onRunningChanged: {
-                        if (!running)
-                            dankIcon.rotation = 0;
-                    }
+                    onRunningChanged: { if (!running) statusIcon.rotation = 0; }
                 }
             }
 
+            // Failure indicator (red).
+            StyledText {
+                text: String(root.failureCount)
+                font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Medium
+                color: Theme.error
+                visible: showFail && root.showCount && countFirst
+            }
+            DankIcon {
+                visible: showFail
+                name: root.iconFailures
+                size: pillIconSize
+                color: Theme.error
+            }
+            StyledText {
+                text: String(root.failureCount)
+                font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Medium
+                color: Theme.error
+                visible: showFail && root.showCount && !countFirst
+            }
+
+            // Pending-updates indicator (primary).
             StyledText {
                 text: String(root.updateCount)
-                font.pixelSize: Theme.fontSizeSmall
-                font.weight: Font.Medium
+                font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Medium
                 color: Theme.primary
-                visible: countVisible && !countFirst
+                visible: showUpd && root.showCount && countFirst
+            }
+            DankIcon {
+                visible: showUpd
+                name: root.iconUpdates
+                size: pillIconSize
+                color: Theme.primary
+            }
+            StyledText {
+                text: String(root.updateCount)
+                font.pixelSize: Theme.fontSizeSmall; font.weight: Font.Medium
+                color: Theme.primary
+                visible: showUpd && root.showCount && !countFirst
+            }
+
+            // Up-to-date / idle icon.
+            DankIcon {
+                visible: showIdle
+                name: root.iconDefault
+                size: pillIconSize
+                color: Theme.surfaceText
             }
         }
 
@@ -2024,26 +2160,26 @@ PluginComponent {
             // global coords break on any monitor whose x/y offset isn't 0 (the
             // tooltip landed far off on DP-1 at x=2560; DP-2 at x=0 worked by
             // coincidence). mapToItem(null, …) matches the DMS bar convention.
-            var p = dankIcon.mapToItem(null, 0, 0);
+            var p = layout.mapToItem(null, 0, 0);
             var edge = root.axis?.edge;
             var gap = Theme.spacingS;
             var bt = root.barThickness;
             if (isVertical) {
-                var cy = p.y + dankIcon.height / 2;
+                var cy = p.y + layout.height / 2;
                 if (edge === "right") {
-                    var barLeft = p.x - (bt - dankIcon.width) / 2;
+                    var barLeft = p.x - (bt - layout.width) / 2;
                     tip.show(tip.text, barLeft - gap, cy, root.parentScreen, false, true);
                 } else {
-                    var barRight = p.x + (bt + dankIcon.width) / 2;
+                    var barRight = p.x + (bt + layout.width) / 2;
                     tip.show(tip.text, barRight + gap, cy, root.parentScreen, true, false);
                 }
             } else {
-                var cx = p.x + dankIcon.width / 2;
+                var cx = p.x + layout.width / 2;
                 if (edge === "bottom") {
-                    var barTop = p.y - (bt - dankIcon.height) / 2;
+                    var barTop = p.y - (bt - layout.height) / 2;
                     tip.show(tip.text, cx, barTop - gap - tip.implicitHeight, root.parentScreen, false, false);
                 } else {
-                    var barBottom = p.y + (bt + dankIcon.height) / 2;
+                    var barBottom = p.y + (bt + layout.height) / 2;
                     tip.show(tip.text, cx, barBottom + gap, root.parentScreen, false, false);
                 }
             }
@@ -2327,7 +2463,7 @@ PluginComponent {
                 StyledText {
                     anchors.verticalCenter: parent.verticalCenter
                     width: Math.max(0, parent.width - (Theme.iconSize - 4) - Theme.spacingS)
-                    text: root.failedPackages.length + (root.failedPackages.length === 1 ? " update didn't apply on the last run" : " updates didn't apply on the last run")
+                    text: root.failureCount + (root.failureCount === 1 ? " update failed and needs attention" : " updates failed and need attention")
                     font.pixelSize: Theme.fontSizeSmall
                     color: Theme.surfaceText
                     wrapMode: Text.WordWrap
@@ -3069,7 +3205,7 @@ PluginComponent {
         if (isUpgrading || remoteUpgrading) return "Updating…";
         if (_externalBusy) return "System update running…";
         if (hasError) return "Update check failed";
-        if (hasFailures) return failedPackages.length + (failedPackages.length === 1 ? " update failed" : " updates failed");
+        if (hasFailures) return failureCount + (failureCount === 1 ? " update failed" : " updates failed");
         return updateCount === 0 ? "Up to date" : updateCount + (updateCount === 1 ? " update available" : " updates available");
     }
     ccWidgetIsActive: updateCount > 0 || hasFailures
@@ -3085,6 +3221,19 @@ PluginComponent {
             border.width: Theme.layerOutlineWidth
             // Default to the menu (counts + actions); flip to the detailed list.
             property string ccView: "menu"
+            // Open the failure surfacing in-panel: a single unresolved failure
+            // jumps to its detail; several go to the history list.
+            function showFailures() {
+                root.loadHistory();
+                root._loadPersistedState();
+                if (root.unresolvedFailures.length === 1) {
+                    root.aiError = "";
+                    root.failureDetail = root.unresolvedFailures[0];
+                    ccView = "faildetail";
+                } else {
+                    ccView = "history";
+                }
+            }
 
             // Pinned failure banner — visible on both tabs so the "something
             // failed" signal never hides behind the toggle. "Log" opens the
@@ -3104,38 +3253,27 @@ PluginComponent {
                 Row {
                     anchors.left: parent.left
                     anchors.leftMargin: Theme.spacingS
-                    anchors.right: ccLogBtn.left
+                    anchors.right: ccBannerBtns.left
                     anchors.rightMargin: Theme.spacingXS
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Theme.spacingXS
                     DankIcon { anchors.verticalCenter: parent.verticalCenter; name: "error"; size: Theme.iconSize - 6; color: Theme.error }
                     StyledText {
                         anchors.verticalCenter: parent.verticalCenter
-                        text: root.failedPackages.length + (root.failedPackages.length === 1 ? " update failed last run" : " updates failed last run")
+                        text: root.failureCount + (root.failureCount === 1 ? " update needs attention" : " updates need attention")
                         font.pixelSize: Theme.fontSizeSmall
                         color: Theme.surfaceText
                         elide: Text.ElideRight
                     }
                 }
-                Rectangle {
-                    id: ccLogBtn
+                Row {
+                    id: ccBannerBtns
                     anchors.right: parent.right
                     anchors.rightMargin: Theme.spacingXS
                     anchors.verticalCenter: parent.verticalCenter
-                    width: ccLogRow.implicitWidth + Theme.spacingM
-                    height: 24
-                    radius: Theme.cornerRadius
-                    color: ccLogHover.containsMouse ? Theme.withAlpha(Theme.error, 0.22) : "transparent"
-                    border.width: 1
-                    border.color: Theme.withAlpha(Theme.error, 0.35)
-                    Row {
-                        id: ccLogRow
-                        anchors.centerIn: parent
-                        spacing: 2
-                        DankIcon { anchors.verticalCenter: parent.verticalCenter; name: "description"; size: Theme.iconSize - 8; color: Theme.error }
-                        StyledText { anchors.verticalCenter: parent.verticalCenter; text: "Log"; font.pixelSize: Theme.fontSizeSmall; color: Theme.error }
-                    }
-                    MouseArea { id: ccLogHover; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.viewLastLog() }
+                    spacing: Theme.spacingXS
+                    FailBannerButton { icon: "troubleshoot"; label: "Details"; onClicked: ccPanel.showFailures() }
+                    FailBannerButton { icon: "description"; label: "Log"; onClicked: root.viewLastLog() }
                 }
             }
 
@@ -3639,6 +3777,9 @@ PluginComponent {
         signal dismissRequested()
         property bool embedded: false
         property real embeddedBodyHeight: 0
+        // Collapsible sections (AI open by default, the verbose log closed).
+        property bool aiExpanded: true
+        property bool logExpanded: false
         readonly property real contentWidth: width - leftPadding - rightPadding
         width: parent ? parent.width : 0
         padding: fdv.embedded ? 0 : root.popoutPad
@@ -3648,11 +3789,8 @@ PluginComponent {
         readonly property string logText: entry && entry.log ? entry.log : ""
         readonly property bool hasVersions: (entry.oldVersion || "") !== "" || (entry.newVersion || "") !== ""
         readonly property var fields: {
+            // Source + version now live in the header; keep Reason/When/Fix here.
             var f = [{ label: "Reason", value: entry.reason || "Failed", err: true }];
-            if (entry.source)
-                f.push({ label: "Source", value: entry.source, err: false });
-            if (hasVersions)
-                f.push({ label: "Attempted", value: (entry.oldVersion || "?") + "  →  " + (entry.newVersion || "?"), err: false });
             f.push({ label: "When", value: root._fmtHistoryWhen(entry.when || ""), err: false });
             if (entry.reason === root.reasonPkgbuildDiff)
                 f.push({ label: "Fix", value: "The package's PKGBUILD changed, so Shelly refused to build it non-interactively. Run \"shelly aur update " + (entry.name || "<pkg>") + "\" in a terminal, review the diff, and accept it — updates from here will work again afterwards.", err: false });
@@ -3661,10 +3799,11 @@ PluginComponent {
             return f;
         }
 
-        // Header: back to history + name + "failed" chip
+        // Header: back + package name / version transition + source & failed
+        // chips (mirrors the package-detail header).
         Item {
             width: fdv.contentWidth
-            height: 40
+            height: 52
             DankActionButton {
                 id: fdBack
                 anchors.left: parent.left
@@ -3675,32 +3814,63 @@ PluginComponent {
                 iconColor: Theme.surfaceText
                 onClicked: fdv.backRequested()
             }
-            StyledText {
+            Column {
                 anchors.left: fdBack.right
                 anchors.leftMargin: Theme.spacingS
-                anchors.right: fdChip.left
+                anchors.right: fdChips.left
                 anchors.rightMargin: Theme.spacingS
                 anchors.verticalCenter: parent.verticalCenter
-                text: fdv.entry.name || ""
-                font.pixelSize: Theme.fontSizeLarge
-                font.weight: Font.Medium
-                color: Theme.surfaceText
-                elide: Text.ElideRight
+                spacing: 1
+                StyledText {
+                    width: parent.width
+                    text: fdv.entry.name || ""
+                    font.pixelSize: Theme.fontSizeLarge
+                    font.weight: Font.Medium
+                    color: Theme.surfaceText
+                    elide: Text.ElideRight
+                }
+                StyledText {
+                    width: parent.width
+                    visible: fdv.hasVersions
+                    text: (fdv.entry.oldVersion || "?") + "  →  " + (fdv.entry.newVersion || "?")
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.primary
+                    elide: Text.ElideRight
+                }
             }
-            Rectangle {
-                id: fdChip
+            Row {
+                id: fdChips
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                width: 52
-                height: 20
-                radius: Theme.cornerRadius
-                color: Theme.withAlpha(Theme.error, 0.22)
-                StyledText {
-                    anchors.centerIn: parent
-                    text: "failed"
-                    font.pixelSize: Theme.fontSizeSmall - 1
-                    font.weight: Font.Bold
-                    color: Theme.error
+                spacing: Theme.spacingXS
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: (fdv.entry.source || "") !== ""
+                    width: fdSrcText.implicitWidth + Theme.spacingS
+                    height: 20
+                    radius: Theme.cornerRadius
+                    color: Theme.secondaryHover
+                    StyledText {
+                        id: fdSrcText
+                        anchors.centerIn: parent
+                        text: fdv.entry.source || ""
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.surfaceVariantText
+                    }
+                }
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 52
+                    height: 20
+                    radius: Theme.cornerRadius
+                    color: Theme.withAlpha(Theme.error, 0.22)
+                    StyledText {
+                        anchors.centerIn: parent
+                        text: "failed"
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        font.weight: Font.Bold
+                        color: Theme.error
+                    }
                 }
             }
         }
@@ -3785,20 +3955,36 @@ PluginComponent {
             color: Theme.error
             wrapMode: Text.WordWrap
         }
-        // "AI suggestion" header with a re-run button (regenerate — useful when
-        // a prior run errored, e.g. the AI CLI wasn't authenticated, and its
-        // error text got saved as the "answer").
+        // "AI suggestion" collapsible header with a re-run button (regenerate —
+        // useful when a prior run errored, e.g. the AI CLI wasn't authenticated
+        // and its error text got saved as the "answer"). Click the row to
+        // collapse/expand; the re-run button sits on top and captures its clicks.
         Item {
             width: fdv.contentWidth
             visible: fdv.aiText !== ""
-            height: visible ? 24 : 0
-            StyledText {
+            height: visible ? 28 : 0
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: fdv.aiExpanded = !fdv.aiExpanded
+            }
+            Row {
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: "AI suggestion"
-                font.pixelSize: Theme.fontSizeSmall
-                font.weight: Font.Medium
-                color: Theme.surfaceVariantText
+                spacing: Theme.spacingXS
+                DankIcon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: fdv.aiExpanded ? "expand_more" : "chevron_right"
+                    size: Theme.iconSize - 6
+                    color: Theme.surfaceVariantText
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "AI suggestion"
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: Theme.surfaceVariantText
+                }
             }
             DankActionButton {
                 anchors.right: parent.right
@@ -3815,7 +4001,7 @@ PluginComponent {
         }
         Rectangle {
             width: fdv.contentWidth
-            visible: fdv.aiText !== ""
+            visible: fdv.aiText !== "" && fdv.aiExpanded
             height: visible ? Math.min(aiCol.implicitHeight + Theme.spacingM * 2,
                                        fdv.embedded ? 220 : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS))) : 0
             radius: Theme.cornerRadius
@@ -3905,20 +4091,42 @@ PluginComponent {
             }
         }
 
-        // Captured log tail
-        StyledText {
+        // Captured log tail — collapsible header (verbose, collapsed by default).
+        Item {
             width: fdv.contentWidth
-            text: fdv.logText !== "" ? "Log (tail of the failed run)" : "No log was saved for this failure."
-            font.pixelSize: Theme.fontSizeSmall
-            font.weight: Font.Medium
-            color: Theme.surfaceVariantText
+            height: 28
+            MouseArea {
+                anchors.fill: parent
+                enabled: fdv.logText !== ""
+                cursorShape: Qt.PointingHandCursor
+                onClicked: fdv.logExpanded = !fdv.logExpanded
+            }
+            Row {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingXS
+                DankIcon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: fdv.logText !== ""
+                    name: fdv.logExpanded ? "expand_more" : "chevron_right"
+                    size: Theme.iconSize - 6
+                    color: Theme.surfaceVariantText
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: fdv.logText !== "" ? "Log (tail of the failed run)" : "No log was saved for this failure."
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: Theme.surfaceVariantText
+                }
+            }
         }
         Rectangle {
             width: fdv.contentWidth
-            visible: fdv.logText !== ""
-            height: fdv.embedded
+            visible: fdv.logText !== "" && fdv.logExpanded
+            height: !visible ? 0 : (fdv.embedded
                 ? Math.max(root.detailRowHeight, fdv.embeddedBodyHeight)
-                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2
+                : Math.max(root.detailRowHeight, root.detailRows * (root.detailRowHeight + Theme.spacingXS)) + Theme.spacingS * 2)
             radius: Theme.cornerRadius
             color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
 
@@ -3947,14 +4155,27 @@ PluginComponent {
             }
         }
 
-        // Open the full live log — only meaningful for the most recent
-        // run (older runs' logs are gone; we only kept the excerpt).
+        // Open the full live log — only meaningful for the most recent run
+        // (older runs' logs are gone; we only kept the excerpt), so gate on the
+        // last-run failure set rather than the broader unresolved set.
         DetailActionButton {
             width: fdv.contentWidth
-            visible: root._isFailed(fdv.entry.name)
+            visible: root.failedPackages.indexOf(fdv.entry.name) !== -1
             icon: "description"
             label: "View full log"
             onTriggered: root.viewLastLog()
+        }
+        // Acknowledge: drop this from the unresolved surfacing (stays in
+        // history). Only offered while it's still surfaced as unresolved.
+        DetailActionButton {
+            width: fdv.contentWidth
+            visible: root._isFailed(fdv.entry.name)
+            icon: "notifications_off"
+            label: "Dismiss (acknowledge)"
+            onTriggered: {
+                root.dismissFailure(fdv.entry.name);
+                fdv.backRequested();
+            }
         }
     }
 

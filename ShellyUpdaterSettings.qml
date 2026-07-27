@@ -21,6 +21,7 @@ PluginSettings {
     property bool detectEnabled: true
     property bool limitEnabled: false
     property bool aiEnabled: false
+    property bool failuresNotifyEnabled: true
     function refreshDependents() {
         tooltipEnabled = loadValue("showTooltip", false);
         aurEnabled = loadValue("enableAur", true);
@@ -28,6 +29,7 @@ PluginSettings {
         detectEnabled = loadValue("detectFailedUpdates", true);
         limitEnabled = loadValue("limitBuildResources", false);
         aiEnabled = loadValue("aiEnabled", false);
+        failuresNotifyEnabled = loadValue("notifyOnFailures", true);
     }
     Component.onCompleted: Qt.callLater(refreshDependents)
     onSettingChanged: refreshDependents()
@@ -509,6 +511,14 @@ PluginSettings {
             label: "Notify when an update fails"
             description: "Send a notification when packages from an update run didn't apply. The notification carries a \"View details\" action (and \"Explain with AI\" when AI analysis is configured in the AI tab)."
             defaultValue: true
+        }
+        ToggleSetting {
+            visible: root.failuresNotifyEnabled
+            height: visible ? implicitHeight : 0
+            settingKey: "notifyFailuresRepeat"
+            label: "Keep reminding until resolved"
+            description: "Re-send the failure notification on each background check while failures remain unresolved (a package is resolved when it updates successfully, is uninstalled, is held, or you dismiss it). Off by default — this can be noisy depending on your check frequency."
+            defaultValue: false
         }
     }
 
