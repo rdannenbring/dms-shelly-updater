@@ -20,6 +20,8 @@ DankBar pill with a detailed updates view and an action menu.
 | Updates view | Action menu |
 |:---:|:---:|
 | ![Updates view](preview/updates.png) | ![Action menu](preview/menu.png) |
+| **Control-center panel** | **AI failure analysis** |
+| ![Control-center panel](preview/control-center.png) | ![AI failure analysis](preview/ai-suggestion.png) |
 | **Update history** | **Hover tooltip** |
 | ![Update history](preview/history.png) | ![Tooltip](preview/tooltip.png) |
 
