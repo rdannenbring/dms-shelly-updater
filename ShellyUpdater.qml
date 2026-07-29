@@ -86,6 +86,10 @@ PluginComponent {
     // Retention for the self-kept failed-update log (days). Capped by the
     // settings slider; clamped defensively here too.
     readonly property int failureHistoryDays: Math.max(1, Math.min(180, parseInt(_pd.failureHistoryDays !== undefined ? _pd.failureHistoryDays : 30)))
+    // Second retention bound (OR'd with the day limit): cap the stored failure
+    // history by approximate size so a run that aborts and flags many packages
+    // (each keeping a log excerpt) can't balloon the state file.
+    readonly property int failureHistoryMaxMB: Math.max(1, Math.min(50, parseInt(_pd.failureHistoryMaxMB !== undefined ? _pd.failureHistoryMaxMB : 10)))
     // Resource limits so big (AUR) builds don't peg the machine and make the
     // desktop unresponsive. Off by default (no change to how updates run).
     readonly property bool limitBuildResources: _pd.limitBuildResources !== undefined ? _pd.limitBuildResources : false
@@ -133,6 +137,28 @@ PluginComponent {
     property bool isUpgrading: false
     property bool hasError: false
     property string errorMessage: ""
+
+    // Installed Shelly major version (0 = not yet detected). This plugin targets
+    // the Shelly v3+ CLI grammar; on an older shelly every call breaks, so we
+    // detect the version once and surface it clearly instead of failing silently.
+    property int shellyMajor: 0
+    property string shellyVersionRaw: ""
+    readonly property bool shellyUnsupported: shellyMajor > 0 && shellyMajor < 3
+
+    // Arch Linux news (Shelly v3 `news`). newsItems is the latest snapshot;
+    // newsSeen maps acknowledged links → true (tracked locally so a background
+    // poll can't consume the unread badge the way `shelly news` does). newsInit
+    // guards the first-run seed that marks all currently-known news read.
+    property var newsItems: []
+    property var newsSeen: ({})
+    property bool newsInit: false
+    property bool newsExpanded: false
+    readonly property int newsUnreadCount: {
+        var c = 0;
+        for (var i = 0; i < newsItems.length; i++)
+            if (!newsSeen[newsItems[i].link]) c++;
+        return c;
+    }
 
     // VCS/devel AUR packages (`-git`, etc.) report "latest-commit" as their new
     // version — upstream commits, not real releases. Optionally exclude them.
@@ -275,6 +301,19 @@ PluginComponent {
         var n = (typeof nameOrItem === "string") ? nameOrItem : ((nameOrItem && nameOrItem.name) || "");
         return root.unresolvedFailures.some(function (f) { return f.name === n; });
     }
+    // A failure that can only be cleared by an interactive re-run (the user must
+    // see and accept a prompt) — currently a changed PKGBUILD, which Shelly
+    // refuses to build under --no-confirm. Drives the "run interactive update"
+    // buttons in the failure detail and the updates list.
+    function _reasonNeedsInteractive(reason) {
+        return reason === root.reasonPkgbuildDiff;
+    }
+    function _needsInteractive(nameOrItem) {
+        var n = (typeof nameOrItem === "string") ? nameOrItem : ((nameOrItem && nameOrItem.name) || "");
+        return root.unresolvedFailures.some(function (f) {
+            return f.name === n && root._reasonNeedsInteractive(f.reason);
+        });
+    }
 
     // Durable, self-kept log of failed updates. pacman.log only records
     // SUCCESSFUL transactions, so failures leave no trace there — we persist our
@@ -302,8 +341,26 @@ PluginComponent {
         return isNaN(t) ? 0 : t;
     }
     function _pruneFailureHistory(list) {
+        // Bound 1 — age: drop entries older than the day limit.
         var cutoff = Date.now() - root.failureHistoryDays * 86400000;
-        return (list || []).filter(function (e) { return root._stampToEpoch(e.when) >= cutoff; });
+        var kept = (list || []).filter(function (e) { return root._stampToEpoch(e.when) >= cutoff; });
+        // Bound 2 — size (OR'd with age): entries are newest-first, so accumulate
+        // from the front and drop the oldest once the serialized history would
+        // exceed the megabyte budget. Always keep at least the newest entry.
+        var maxBytes = root.failureHistoryMaxMB * 1048576;
+        if (maxBytes > 0 && kept.length > 1) {
+            var total = 0;
+            var out = [];
+            for (var i = 0; i < kept.length; i++) {
+                var sz = JSON.stringify(kept[i]).length + 1; // +1 ≈ array separator
+                if (out.length > 0 && total + sz > maxBytes)
+                    break;
+                total += sz;
+                out.push(kept[i]);
+            }
+            kept = out;
+        }
+        return kept;
     }
     function loadFailureHistory() {
         if (!(pluginService && pluginService.loadPluginState))
@@ -451,6 +508,10 @@ PluginComponent {
             try {
                 root.lastRunSummary = JSON.parse(pluginService.loadPluginState(pluginId, "lastRunSummary", "null"));
             } catch (e2) {}
+            try {
+                root.newsSeen = JSON.parse(pluginService.loadPluginState(pluginId, "newsSeen", "{}")) || {};
+                root.newsInit = pluginService.loadPluginState(pluginId, "newsInit", "false") === "true";
+            } catch (e3) {}
         }
         // Fallback (also when the pluginService store came back empty, as it can
         // for the control-center instance): read the on-disk state file. Cheap
@@ -564,6 +625,10 @@ PluginComponent {
     readonly property string donePath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/shelly-updater-last.done"
     property double _runToken: 0
     property bool _awaitingTerminal: false
+    // Consecutive completion-polls where the marker was absent AND nothing
+    // related to the update was running — drives the watchdog that force-clears
+    // a stuck isUpgrading if a terminal died without writing its marker.
+    property int _doneIdleStreak: 0
 
     // Each monitor gets its own plugin instance with independent state. A local
     // refresh() only updates this instance; refreshAll() broadcasts to every
@@ -571,6 +636,26 @@ PluginComponent {
     // refreshes). The broadcast rides DMS's shared plugin-state change signal.
     property double _refreshToken: 0
 
+    // Escape hatch for a wedged refresh/upgrade: clear every in-flight flag and
+    // re-check from a clean slate — the practical equivalent of reloading the
+    // plugin, without restarting DMS. (The stuck-terminal watchdog normally
+    // prevents a wedge, but this is a guaranteed manual recovery.) NOTE: this
+    // does NOT touch a terminal that may still be running — it only resets the
+    // widget's own state; a genuinely in-progress build will be re-detected by
+    // the busy probe on the re-check.
+    function resetState() {
+        isChecking = false;
+        isUpgrading = false;
+        _awaitingTerminal = false;
+        _doneIdleStreak = 0;
+        _awaitingUpgradeResult = false;
+        _externalBusy = false;
+        _probing = false;
+        _checkQueue = [];
+        _writeUpgradeBeat(0); // stop the cross-monitor "updating" spinner
+        refreshAll();     // sync the other monitors' instances
+        refresh(false);   // guarantee a local re-check (the CC instance gets no broadcast)
+    }
     function refreshAll() {
         var token = Date.now();
         _refreshToken = token;
@@ -690,8 +775,16 @@ PluginComponent {
     function _doRefresh(isBackground) {
         if (isChecking || isUpgrading)
             return;
+        // Old shelly → every call breaks. Surface once, skip the broken checks.
+        if (shellyUnsupported) {
+            hasError = true;
+            errorMessage = "Requires Shelly v3 or newer (found " + shellyVersionRaw + "). Update the shelly package.";
+            return;
+        }
         isChecking = true;
         _bgCheck = isBackground === true;
+        if (isBackground !== true)
+            newsProc.running = true; // refresh Arch news on user-initiated checks only
         hasError = false;
         errorMessage = "";
         pacmanUpdates = [];
@@ -699,13 +792,16 @@ PluginComponent {
         flatpakUpdates = [];
         appimageUpdates = [];
         loadIgnored();
-        var q = [{ src: "pacman", cmd: ["shelly", "list-updates", "--json"] }];
+        // Shelly v3 grammar: `list-updates <type> --json` (was `<type> list-updates`).
+        // Kept per-backend (not the combined `list-updates all`) so the enable
+        // flags still skip the slow AUR RPC / flatpak calls when disabled.
+        var q = [{ src: "pacman", cmd: ["shelly", "list-updates", "standard", "--json"] }];
         if (enableAur)
-            q.push({ src: "aur", cmd: ["shelly", "aur", "list-updates", "--json"] });
+            q.push({ src: "aur", cmd: ["shelly", "list-updates", "aur", "--json"] });
         if (enableFlatpak)
-            q.push({ src: "flatpak", cmd: ["shelly", "flatpak", "list-updates", "--json"] });
+            q.push({ src: "flatpak", cmd: ["shelly", "list-updates", "flatpak", "--json"] });
         if (enableAppimage)
-            q.push({ src: "appimage", cmd: ["shelly", "appimage", "list-updates", "--json"] });
+            q.push({ src: "appimage", cmd: ["shelly", "list-updates", "appimage", "--json"] });
         _checkQueue = q;
         _runNextCheck();
     }
@@ -842,11 +938,14 @@ PluginComponent {
     // =====================================================================
     // touchesKernel: when true and "always confirm kernel updates" is enabled,
     // the interactive prompt is forced even if global confirmations are off.
-    function runInTerminal(shellyArgs, title, touchesKernel) {
+    function runInTerminal(shellyArgs, title, touchesKernel, forceInteractive) {
         if (isUpgrading)
             return;
         var forceConfirm = alwaysConfirmKernel && touchesKernel === true;
-        var full = (!confirmations && !forceConfirm) ? shellyArgs.concat(["--no-confirm"]) : shellyArgs;
+        // forceInteractive (the "run interactive update" buttons) never appends
+        // --no-confirm, so Shelly can prompt to review/accept a changed PKGBUILD
+        // even when global confirmations are off.
+        var full = (!confirmations && !forceConfirm && forceInteractive !== true) ? shellyArgs.concat(["--no-confirm"]) : shellyArgs;
         // flock only wraps the shelly command (released before the read prompt),
         // so background checks on other monitors wait rather than colliding.
         // The resource prefix (nice/ionice/job-limit) is inherited by every
@@ -870,13 +969,18 @@ PluginComponent {
         // finishes (status + log are already written by then), so the counts
         // refresh immediately instead of waiting for the user to close the
         // window. The EXIT trap remains a fallback for a window closed mid-run.
-        var body = closeTerminalOnDone
-            ? work
-            : work + "; " + doneCmd + "; echo; echo '── " + (title || "Done") + " ── Press Enter to close'; read _";
+        // Interactive runs (the per-package "run in terminal" buttons) always hold
+        // the window open on a "Press Enter" prompt so the user can read whatever
+        // output was produced, regardless of the global closeTerminalOnDone setting.
+        var keepOpen = !closeTerminalOnDone || forceInteractive === true;
+        var body = keepOpen
+            ? work + "; " + doneCmd + "; echo; echo '── " + (title || "Done") + " ── Press Enter to close'; read _"
+            : work;
         var inner = "trap " + _shq(doneCmd) + " EXIT; trap exit HUP TERM INT; " + body;
         Quickshell.execDetached(_launchArgv(inner));
         isUpgrading = true;
         _writeUpgradeBeat(Date.now()); // broadcast "updating" to all monitors
+        _doneIdleStreak = 0; // reset the stuck-terminal watchdog for this run
         _awaitingTerminal = true; // start polling for the completion marker
     }
 
@@ -956,7 +1060,8 @@ PluginComponent {
     }
 
     function updateAll() {
-        var args = ["shelly", "upgrade-all"];
+        // Shelly v3: `upgrade all` (was `upgrade-all`); --no-* still valid here.
+        var args = ["shelly", "upgrade", "all"];
         if (!enableAur) args.push("--no-aur");
         if (!enableFlatpak) args.push("--no-flatpak");
         if (!enableAppimage) args.push("--no-appimage");
@@ -965,50 +1070,72 @@ PluginComponent {
     }
     function updatePacman() {
         _beginUpgrade(_namesOf(pacmanUpdatesShown));
-        runInTerminal(["shelly", "upgrade"], "System Packages", hasKernelUpdate);
+        runInTerminal(["shelly", "upgrade", "standard"], "System Packages", hasKernelUpdate);
     }
     function updateAur() {
         _beginUpgrade(_namesOf(aurUpdatesShown));
-        runInTerminal(["shelly", "aur", "upgrade"], "AUR", false);
+        runInTerminal(["shelly", "upgrade", "aur"], "AUR", false);
     }
     function updateFlatpak() {
         _beginUpgrade(_namesOf(flatpakUpdates));
-        runInTerminal(["shelly", "flatpak", "upgrade"], "Flatpak", false);
+        runInTerminal(["shelly", "upgrade", "flatpak"], "Flatpak", false);
     }
     function updateAppimage() {
         _beginUpgrade(_namesOf(appimageUpdates));
-        runInTerminal(["shelly", "appimage", "upgrade"], "AppImage", false);
+        runInTerminal(["shelly", "upgrade", "appimage"], "AppImage", false);
     }
 
     function updateOne(item) {
+        // Shelly v3 grammar: `update <type> <name>` (was `<type> update <name>`).
         var args;
         if (item.source === "pacman")
-            args = ["shelly", "update", item.name];
+            args = ["shelly", "update", "standard", item.name];
         else if (item.source === "aur")
-            args = ["shelly", "aur", "update", item.name];
+            args = ["shelly", "update", "aur", item.name];
         else if (item.source === "flatpak")
-            args = ["shelly", "flatpak", "update", item.id];
+            args = ["shelly", "update", "flatpak", item.id];
         else if (item.source === "appimage")
-            args = ["shelly", "appimage", "upgrade"];
+            args = ["shelly", "upgrade", "appimage"];
         else
             return;
         _beginUpgrade([item.name]);
         runInTerminal(args, item.name, item.source === "pacman" && _isKernel(item));
     }
 
-    // Interactive downgrade (Shelly lists installable older versions to pick).
-    function downgradeOne(item) {
-        if (!item)
+    // Re-run a single package's update INTERACTIVELY (visible terminal, never
+    // --no-confirm) so the user can accept a changed PKGBUILD / review prompt
+    // that a non-interactive upgrade silently skipped. Accepts an updates item
+    // or a failure entry — both carry {name, source} (flatpak also {id}).
+    function runInteractiveUpdate(item) {
+        if (!item || !item.name)
             return;
+        var args;
         if (item.source === "aur")
-            runInTerminal(["shelly", "aur", "install-version", item.name], "Downgrade " + item.name, false);
+            args = ["shelly", "update", "aur", item.name];
+        else if (item.source === "pacman")
+            args = ["shelly", "update", "standard", item.name];
+        else if (item.source === "flatpak")
+            args = ["shelly", "update", "flatpak", item.id || item.name];
         else
-            runInTerminal(["shelly", "downgrade", item.name], "Downgrade " + item.name, _isKernel(item));
+            return;
+        _beginUpgrade([item.name]);
+        runInTerminal(args, "Update " + item.name, false, true); // forceInteractive
     }
 
-    // Maintenance
-    function cleanCache() { runInTerminal(["shelly", "cache-clean"], "Clean Package Cache", false); }
-    function removeOrphans() { runInTerminal(["shelly", "purify"], "Remove Orphans", false); }
+    // Downgrade a standard package (Shelly lists installable older versions to
+    // pick). Shelly v3 removed interactive AUR version selection — `install aur
+    // -v` now requires an explicit git commit — so AUR downgrade is disabled
+    // until the commit-picker lands (2.1.0); the button is hidden for AUR.
+    function downgradeOne(item) {
+        if (!item || item.source !== "pacman")
+            return;
+        runInTerminal(["shelly", "downgrade", item.name], "Downgrade " + item.name, _isKernel(item));
+    }
+
+    // Maintenance — Shelly v3: `cache-clean` → `purify standard -c` (retain
+    // default 3 versions); bare `purify` → `purify standard -o` (include orphans).
+    function cleanCache() { runInTerminal(["shelly", "purify", "standard", "-c"], "Clean Package Cache", false); }
+    function removeOrphans() { runInTerminal(["shelly", "purify", "standard", "-o"], "Remove Orphans", false); }
 
     // Poll the detached terminal's completion marker. `cat` prints the token the
     // trap wrote; matching it to this run's token means the terminal finished.
@@ -1021,10 +1148,35 @@ PluginComponent {
     }
     Process {
         id: doneCheckProc
-        command: ["cat", root.donePath]
+        // Read the marker AND probe whether the update pipeline is still alive.
+        // `script`/`flock` wrap the whole session; `shelly` is alive even while
+        // sitting at an interactive prompt; makepkg/pacman/db.lck cover the build
+        // and transaction. Tab-separated: "<marker>\t<live|idle>".
+        command: ["sh", "-c",
+            "m=$(cat " + _shq(root.donePath) + " 2>/dev/null); " +
+            "if pgrep -x script >/dev/null 2>&1 || pgrep -x flock >/dev/null 2>&1 || pgrep -x shelly >/dev/null 2>&1 || pgrep -x makepkg >/dev/null 2>&1 || pgrep -x pacman >/dev/null 2>&1 || [ -e /var/lib/pacman/db.lck ]; then a=live; else a=idle; fi; " +
+            "printf '%s\\t%s' \"$m\" \"$a\""]
         stdout: StdioCollector {
             onStreamFinished: {
-                if ((text || "").trim() === String(root._runToken)) {
+                var parts = String(text || "").split("\t");
+                var marker = (parts[0] || "").trim();
+                var live = (parts[1] || "").trim() === "live";
+                if (marker === String(root._runToken)) {
+                    root._doneIdleStreak = 0;
+                    root._awaitingTerminal = false;
+                    root._onTerminalDone();
+                    return;
+                }
+                // Watchdog: the marker never arrived (terminal died/failed to
+                // launch without writing it). If nothing update-related is
+                // running for a few consecutive polls (~9s), treat the run as
+                // finished so isUpgrading can't stay stuck until a DMS restart.
+                // Stays armed through interactive review because `shelly` is
+                // alive then (→ live → streak resets).
+                if (live) {
+                    root._doneIdleStreak = 0;
+                } else if (++root._doneIdleStreak >= 3) {
+                    root._doneIdleStreak = 0;
                     root._awaitingTerminal = false;
                     root._onTerminalDone();
                 }
@@ -1323,12 +1475,12 @@ PluginComponent {
             // field it lacks (build date). If that fails, we keep the seed.
             root.detailData = root._buildDetail(item, item.raw || null);
             root.detailLoading = false;
-            detailProc.command = withLock(["shelly", "query", item.name, "--detail", "-a", "--json"]);
+            detailProc.command = withLock(["shelly", "search", "standard", item.name, "--json"]);
             detailProc.running = true;
         } else if (item.source === "aur") {
             root.detailData = null;
             root.detailLoading = true;
-            detailProc.command = withLock(["shelly", "aur", "search", item.name, "--json"]);
+            detailProc.command = withLock(["shelly", "search", "aur", item.name, "--json"]);
             detailProc.running = true;
         } else {
             root.detailData = root._buildDetail(item, null);
@@ -1375,7 +1527,7 @@ PluginComponent {
         }
         onExited: exitCode => {
             if (exitCode !== 0 && !root.detailData && !root.detailError)
-                root.detailError = "shelly query exited with code " + exitCode;
+                root.detailError = "shelly search exited with code " + exitCode;
             root.detailLoading = false;
         }
     }
@@ -1400,19 +1552,21 @@ PluginComponent {
     // Held / ignored packages (shelly ignore list)
     // =====================================================================
     function loadIgnored() {
-        ignoreProc.command = withLock(["shelly", "ignore", "--list", "--json"]);
+        // Shelly v3: `mark ignore -l/-a/-r` (was `ignore --list/--add/--remove`).
+        // `-l -j` returns a bare JSON array of names.
+        ignoreProc.command = withLock(["shelly", "mark", "ignore", "-l", "--json"]);
         ignoreProc.running = true;
     }
     function holdPackage(name) {
         if (!name)
             return;
-        ignoreMutateProc.command = withLock(["shelly", "ignore", "--add", name, "-n"]);
+        ignoreMutateProc.command = withLock(["shelly", "mark", "ignore", "-a", name, "-n"]);
         ignoreMutateProc.running = true;
     }
     function unholdPackage(name) {
         if (!name)
             return;
-        ignoreMutateProc.command = withLock(["shelly", "ignore", "--remove", name, "-n"]);
+        ignoreMutateProc.command = withLock(["shelly", "mark", "ignore", "-r", name, "-n"]);
         ignoreMutateProc.running = true;
     }
 
@@ -2030,6 +2184,8 @@ PluginComponent {
 
     Component.onCompleted: {
         envProc.running = true; // detect {environment} for AI prompts
+        shellyVerProc.running = true; // detect Shelly major version (v3+ required)
+        newsProc.running = true; // fetch Arch news for the pre-update banner
         // pluginService is usually NULL here (assigned after) — _loadPersistedState
         // no-ops then and re-runs from onPluginServiceChanged below.
         _loadPersistedState();
@@ -2044,6 +2200,101 @@ PluginComponent {
     Connections {
         target: root
         function onPluginServiceChanged() { root._loadPersistedState(); }
+    }
+
+    // Detect the installed Shelly major version once at startup. `shelly
+    // --version` prints a single line like "3.0.0+9"; the leading integer is the
+    // major. If it's older than 3, shellyUnsupported gates refresh and shows a
+    // clear banner rather than letting every v3-grammar call fail as parse noise.
+    Process {
+        id: shellyVerProc
+        command: ["shelly", "--version"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var t = (text || "").trim();
+                root.shellyVersionRaw = t;
+                var m = t.match(/(\d+)/);
+                root.shellyMajor = m ? parseInt(m[1], 10) : 0;
+                if (root.shellyUnsupported) {
+                    root.hasError = true;
+                    root.errorMessage = "Requires Shelly v3 or newer (found " + t + "). Update the shelly package.";
+                }
+            }
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+    }
+
+    // Fetch the latest Arch news (all entries, not just unread — `shelly news`
+    // without -a marks entries viewed in its own cache, which would consume the
+    // badge before the user sees it). Unread is derived locally against newsSeen.
+    Process {
+        id: newsProc
+        command: ["shelly", "news", "-a", "--json"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    var d = JSON.parse((text || "").trim() || "[]");
+                    if (!Array.isArray(d)) d = [];
+                    var items = [];
+                    for (var i = 0; i < d.length; i++) {
+                        var o = d[i];
+                        if (!o || !o.Link) continue;
+                        items.push({ title: o.Title || o.Link, link: o.Link, desc: o.Description || "", pubDate: o.PubDate || "" });
+                    }
+                    root.newsItems = items;
+                    // First run: acknowledge everything currently known so the
+                    // badge only fires for news that lands later — no flood of
+                    // old notices the user already saw via the CLI/wizard.
+                    if (!root.newsInit) {
+                        var seed = {};
+                        for (var j = 0; j < items.length; j++)
+                            seed[items[j].link] = true;
+                        root.newsSeen = seed;
+                        root.newsInit = true;
+                        root._saveNewsState();
+                    }
+                } catch (e) {}
+            }
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+    }
+    function _saveNewsState() {
+        if (pluginService && pluginService.savePluginState) {
+            pluginService.savePluginState(pluginId, "newsSeen", JSON.stringify(root.newsSeen));
+            pluginService.savePluginState(pluginId, "newsInit", root.newsInit ? "true" : "false");
+        }
+    }
+    function markNewsRead(link) {
+        if (!link)
+            return;
+        var s = {};
+        for (var k in root.newsSeen)
+            s[k] = root.newsSeen[k];
+        s[link] = true;
+        root.newsSeen = s;
+        _saveNewsState();
+    }
+    function markAllNewsRead() {
+        var s = {};
+        for (var k in root.newsSeen)
+            s[k] = true;
+        for (var i = 0; i < root.newsItems.length; i++)
+            s[root.newsItems[i].link] = true;
+        root.newsSeen = s;
+        _saveNewsState();
+    }
+    function openNews(link) {
+        if (!link)
+            return;
+        Qt.openUrlExternally(link);
+        markNewsRead(link);
+    }
+    // "Fri, 31 Oct 2025 21:20:51 +0000" → "Oct 31, 2025" (fall back to raw).
+    function _fmtNewsDate(s) {
+        if (!s)
+            return "";
+        var d = new Date(s);
+        return isNaN(d.getTime()) ? s : Qt.formatDate(d, "MMM d, yyyy");
     }
 
     Loader {
@@ -2676,6 +2927,135 @@ PluginComponent {
             }
         }
 
+        // Arch news banner — surfaces unread Arch Linux news (manual-intervention
+        // notices etc.) right where the user updates. Read state is tracked
+        // locally; "Review" expands the headlines, a headline opens it in the
+        // browser and marks it read, "Mark read" clears the badge.
+        Column {
+            width: uv.contentWidth
+            visible: !uv.embedded && root.newsUnreadCount > 0
+            spacing: Theme.spacingXS
+
+            Rectangle {
+                width: parent.width
+                height: 44
+                radius: Theme.cornerRadius
+                color: Theme.withAlpha(Theme.warning, 0.12)
+                border.width: 1
+                border.color: Theme.withAlpha(Theme.warning, 0.35)
+                Row {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Theme.spacingM
+                    anchors.right: newsBtns.left
+                    anchors.rightMargin: Theme.spacingS
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.spacingS
+                    DankIcon {
+                        anchors.verticalCenter: parent.verticalCenter
+                        name: "newspaper"
+                        size: Theme.iconSize - 4
+                        color: Theme.warning
+                    }
+                    StyledText {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Math.max(0, parent.width - (Theme.iconSize - 4) - Theme.spacingS)
+                        text: root.newsUnreadCount + (root.newsUnreadCount === 1 ? " new Arch news item — review before updating" : " new Arch news items — review before updating")
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.surfaceText
+                        wrapMode: Text.WordWrap
+                        maximumLineCount: 2
+                        elide: Text.ElideRight
+                    }
+                }
+                Row {
+                    id: newsBtns
+                    anchors.right: parent.right
+                    anchors.rightMargin: Theme.spacingS
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.spacingXS
+                    FailBannerButton {
+                        icon: root.newsExpanded ? "expand_less" : "expand_more"
+                        label: root.newsExpanded ? "Hide" : "Review"
+                        onClicked: root.newsExpanded = !root.newsExpanded
+                    }
+                    FailBannerButton {
+                        icon: "done_all"
+                        label: "Mark read"
+                        onClicked: { root.markAllNewsRead(); root.newsExpanded = false; }
+                    }
+                }
+            }
+
+            // Expanded headlines (unread only). Each row opens the article.
+            Rectangle {
+                width: parent.width
+                visible: root.newsExpanded
+                height: visible ? newsCol.implicitHeight + Theme.spacingS * 2 : 0
+                radius: Theme.cornerRadius
+                color: Qt.rgba(Theme.surfaceVariant.r, Theme.surfaceVariant.g, Theme.surfaceVariant.b, 0.1)
+                Column {
+                    id: newsCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Theme.spacingS
+                    spacing: Theme.spacingXS
+                    Repeater {
+                        model: root.newsItems.filter(function (n) { return !root.newsSeen[n.link]; })
+                        delegate: Rectangle {
+                            width: newsCol.width
+                            height: nrow.implicitHeight + Theme.spacingXS * 2
+                            radius: Theme.cornerRadius
+                            color: nMouse.containsMouse ? Theme.withAlpha(Theme.warning, 0.10) : "transparent"
+                            Row {
+                                id: nrow
+                                anchors.left: parent.left
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.leftMargin: Theme.spacingXS
+                                anchors.rightMargin: Theme.spacingXS
+                                spacing: Theme.spacingS
+                                DankIcon {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    name: "open_in_new"
+                                    size: Theme.iconSize - 8
+                                    color: Theme.surfaceVariantText
+                                }
+                                Column {
+                                    width: Math.max(0, nrow.width - (Theme.iconSize - 8) - Theme.spacingS)
+                                    spacing: 0
+                                    StyledText {
+                                        width: parent.width
+                                        text: modelData.title
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        color: Theme.surfaceText
+                                        wrapMode: Text.WordWrap
+                                        maximumLineCount: 2
+                                        elide: Text.ElideRight
+                                    }
+                                    StyledText {
+                                        width: parent.width
+                                        visible: !!modelData.pubDate
+                                        text: root._fmtNewsDate(modelData.pubDate)
+                                        font.pixelSize: Theme.fontSizeSmall - 2
+                                        color: Theme.surfaceVariantText
+                                        elide: Text.ElideRight
+                                    }
+                                }
+                            }
+                            MouseArea {
+                                id: nMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.openNews(modelData.link)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // List — height follows the configured number of rows in the popout,
         // or fills the control-center panel (embeddedListHeight) when embedded.
         Rectangle {
@@ -2719,6 +3099,11 @@ PluginComponent {
                     readonly property bool rowIsDevel: modelData.source === "aur" && root._isDevelAur(modelData)
                     // Attempted last run but still pending → didn't apply.
                     readonly property bool rowIsFailed: root._isFailed(modelData)
+                    // Failed because the PKGBUILD changed → needs an interactive re-run.
+                    readonly property bool rowNeedsInteractive: root._needsInteractive(modelData)
+                    // Per-package interactive update applies to everything but AppImage
+                    // (which has no per-item interactive form).
+                    readonly property bool rowCanInteractive: modelData.source === "pacman" || modelData.source === "aur" || modelData.source === "flatpak"
                     width: ListView.view ? ListView.view.width : 0
                     height: root.detailRowHeight
                     radius: Theme.cornerRadius
@@ -2771,7 +3156,7 @@ PluginComponent {
 
                         Column {
                             anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - 52 - 32 - Theme.spacingM * 3
+                            width: parent.width - 52 - 32 - (rowCanInteractive ? 30 + Theme.spacingM : 0) - Theme.spacingM * 3
                             spacing: 2
                             StyledText {
                                 width: parent.width
@@ -2810,14 +3195,41 @@ PluginComponent {
                             }
                         }
 
+                        // Per-row interactive update: run THIS package's update in a
+                        // terminal (never --no-confirm). Always offered as a pre-emptive
+                        // option; highlighted amber when the package is flagged
+                        // review-required (a changed PKGBUILD that skipped silently).
+                        DankActionButton {
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: rowCanInteractive
+                            buttonSize: 30
+                            iconName: "terminal"
+                            iconSize: 18
+                            iconColor: rowNeedsInteractive ? Theme.warning : Theme.surfaceVariantText
+                            // Stay enabled (so a click is consumed here, not passed
+                            // through to the row → detail view) but dim + no-op while
+                            // an update is already running.
+                            opacity: root.isUpgrading ? 0.4 : 1.0
+                            tooltipText: rowNeedsInteractive
+                                ? "Review required — run an interactive update to accept the changed PKGBUILD"
+                                : "Run this update in a terminal (interactive)"
+                            onClicked: {
+                                if (root.isUpgrading)
+                                    return;
+                                root.runInteractiveUpdate(modelData);
+                                uv.dismissRequested();
+                            }
+                        }
                         DankActionButton {
                             anchors.verticalCenter: parent.verticalCenter
                             buttonSize: 30
                             iconName: "download"
                             iconSize: 18
                             iconColor: Theme.primary
-                            enabled: !root.isUpgrading
+                            opacity: root.isUpgrading ? 0.4 : 1.0
                             onClicked: {
+                                if (root.isUpgrading)
+                                    return;
                                 root.updateOne(modelData);
                                 uv.dismissRequested();
                             }
@@ -3056,6 +3468,11 @@ PluginComponent {
             onTriggered: { root.openShellyUi(); mv.dismissRequested(); }
         }
         MenuItem {
+            itemIcon: "restart_alt"; itemLabel: "Reset"
+            itemSubtitle: "Clear a stuck refresh/update and re-check"
+            onTriggered: { root.resetState(); mv.dismissRequested(); }
+        }
+        MenuItem {
             itemIcon: "settings"; itemLabel: "Settings"
             onTriggered: { root.openPluginSettings(); mv.dismissRequested(); }
         }
@@ -3283,7 +3700,8 @@ PluginComponent {
             readonly property bool isHeld: dv.pkg ? root._isHeld(dv.pkg.name) : false
             // ignore/downgrade apply to pacman/AUR, not flatpak/appimage.
             readonly property bool canHold: dv.pkg && (dv.pkg.source === "pacman" || dv.pkg.source === "aur")
-            readonly property bool canDowngrade: canHold
+            // v3: AUR downgrade needs a commit-picker (2.1.0) — standard only for now.
+            readonly property bool canDowngrade: dv.pkg && dv.pkg.source === "pacman"
 
             DetailActionButton {
                 visible: parent.canHold
@@ -3989,7 +4407,7 @@ PluginComponent {
             var f = [{ label: "Reason", value: entry.reason || "Failed", err: true }];
             f.push({ label: "When", value: root._fmtHistoryWhen(entry.when || ""), err: false });
             if (entry.reason === root.reasonPkgbuildDiff)
-                f.push({ label: "Fix", value: "The package's PKGBUILD changed, so Shelly refused to build it non-interactively. Run \"shelly aur update " + (entry.name || "<pkg>") + "\" in a terminal, review the diff, and accept it — updates from here will work again afterwards.", err: false });
+                f.push({ label: "Fix", value: "The package's PKGBUILD changed, so Shelly refused to build it non-interactively. Use \"Run interactive update\" below (or run \"shelly update aur " + (entry.name || "<pkg>") + "\" in a terminal), review the diff, and accept it — updates will work again afterwards.", err: false });
             if (entry.reason === root.reasonDepConflict)
                 f.push({ label: "Fix", value: "An upgrade needs a newer shared library (soname) than a held or AUR package provides — held packages aren't upgraded but still block resolution, so the whole transaction is refused. This usually means a package group must be rebuilt together against the new library (e.g. the hypr* -git stack after a libhyprutils soname bump): rebuild the whole group in one go, then run the update again. See the \"breaks dependency …\" lines in the log below for the exact library and packages involved.", err: false });
             return f;
@@ -4095,6 +4513,20 @@ PluginComponent {
                         wrapMode: Text.WrapAnywhere
                     }
                 }
+            }
+        }
+
+        // Review-required failure (changed PKGBUILD): the actual fix is an
+        // interactive re-run where the user accepts the diff. Primary action,
+        // shown above the AI/log buttons for the reasons that need it.
+        DetailActionButton {
+            width: fdv.contentWidth
+            visible: fdv.entry && root._reasonNeedsInteractive(fdv.entry.reason) && !root.isUpgrading
+            icon: "rate_review"
+            label: "Run interactive update"
+            onTriggered: {
+                root.runInteractiveUpdate(fdv.entry);
+                fdv.dismissRequested();
             }
         }
 

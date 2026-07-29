@@ -740,6 +740,17 @@ PluginSettings {
             maximum: 180
             unit: "days"
         }
+        SliderWithReset {
+            visible: root.detectEnabled
+            height: visible ? implicitHeight : 0
+            settingKey: "failureHistoryMaxMB"
+            label: "…or cap history size at"
+            description: "A second limit, applied together with the days above (OR): whenever the stored failure history grows past this many megabytes, the oldest entries are dropped until it fits. Each entry keeps a log excerpt, so a single update that aborts and flags many packages can add a lot at once — this stops the state file from ballooning. Approximate (measures the history itself, which is the bulk of the state file)."
+            defaultValue: 10
+            minimum: 1
+            maximum: 50
+            unit: "MB"
+        }
 
         SectionHeader {
             title: "Performance"
