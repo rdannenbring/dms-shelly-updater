@@ -2,7 +2,7 @@
     "id": "shellyUpdater",
     "name": "Shelly Updater",
     "description": "Comprehensive system update widget backed by the Shelly (ALPM) CLI — pacman, AUR, Flatpak and AppImage in one DankBar pill with a detailed updates view and an action menu.",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "license": "MIT",
     "author": "rdannenbring",
     "icon": "system_update_alt",

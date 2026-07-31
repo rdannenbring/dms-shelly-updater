@@ -276,6 +276,8 @@ PluginComponent {
             seen[f.name] = true;
             if (f.dismissed || f.resolved)
                 continue;
+            if (!root._isActionableFailure(f.reason))
+                continue; // advisory (batch abort) — the package is just still pending
             if (shown[f.name])
                 out.push(f);
         }
@@ -313,6 +315,18 @@ PluginComponent {
         return root.unresolvedFailures.some(function (f) {
             return f.name === n && root._reasonNeedsInteractive(f.reason);
         });
+    }
+    // Only SPECIFIC, diagnosable causes are actionable per-package failures that
+    // deserve the persistent red "failed" flag: a build error, a changed PKGBUILD,
+    // or a dependency conflict. A generic "Transaction failed" / "Update failed" /
+    // "Did not apply" means an Update All aborted and the package simply didn't
+    // apply — it's still pending (already shown in the list), so it's advisory,
+    // not a failure. Advisory records still live in the history; they just don't
+    // flag packages or inflate the count/banner/notifications.
+    function _isActionableFailure(reason) {
+        return reason === "Build failed"
+            || reason === root.reasonPkgbuildDiff
+            || reason === root.reasonDepConflict;
     }
 
     // Durable, self-kept log of failed updates. pacman.log only records
@@ -1751,10 +1765,17 @@ PluginComponent {
     function _notifyFailures(failed) {
         if (!notifyOnFailures || !failed || failed.length === 0)
             return;
-        var summary = failed.length === 1
-            ? failed[0] + " failed to update"
-            : failed.length + " updates failed";
-        _sendFailureNotification(failed, summary);
+        // Only notify for actionable failures — a transaction abort flags every
+        // pending package but is advisory, so it shouldn't fire "N updates failed".
+        var actionable = root.unresolvedFailures.filter(function (f) {
+            return failed.indexOf(f.name) !== -1;
+        }).map(function (f) { return f.name; });
+        if (actionable.length === 0)
+            return;
+        var summary = actionable.length === 1
+            ? actionable[0] + " failed to update"
+            : actionable.length + " updates failed";
+        _sendFailureNotification(actionable, summary);
     }
     // Persistent reminder on background checks while failures remain unresolved.
     function _maybeNotifyFailuresRepeat() {
