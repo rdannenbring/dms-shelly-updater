@@ -353,7 +353,7 @@ PluginComponent {
     // External sources are DELIBERATELY excluded from failure tracking and AI
     // analysis — both parse Shelly/pacman build logs and would mis-classify a
     // firmware or plugin run.
-    readonly property var extProviders: [
+    readonly property var extBuiltinProviders: [
         {
             id: "dmsPlugins",
             label: "DMS Plugins",
@@ -361,9 +361,21 @@ PluginComponent {
             rank: 0,
             bin: "dms",
             listCmd: ["dms", "plugins", "update", "--all", "--check"],
-            parse: function (text) { return root._parseDmsPlugins(text); },
+            // "Update available for plugin: I/O Monitor (ID: ioMonitor)".
+            // No versions — DMS plugins are git checkouts, not releases.
+            // `exclude` keeps us from offering to update OURSELVES: that
+            // rewrites the plugin directory, and DMS reloads the plugin the
+            // moment it changes, tearing down this component mid-run.
+            parseSpec: {
+                type: "regex",
+                pattern: "^Update available for plugin:\\s*(.+?)\\s*\\(ID:\\s*([^)]+)\\)\\s*$",
+                name: 1,
+                id: 2,
+                versionText: "update available",
+                exclude: ["shellyUpdater"]
+            },
             applyAll: ["dms", "plugins", "update", "--all"],
-            applyOne: function (item) { return ["dms", "plugins", "update", item.id]; },
+            applyOne: ["dms", "plugins", "update", "{id}"],
             readOnly: false,
             note: "",
             // Queries the plugin registry over the network and takes ~40s.
@@ -384,44 +396,199 @@ PluginComponent {
             // hand-off only: the terminal opens and fwupdmgr runs its own
             // confirmation prompts. Never silently applied.
             applyAll: ["fwupdmgr", "update"],
-            applyOne: function (item) { return ["fwupdmgr", "update", item.id]; },
+            applyOne: ["fwupdmgr", "update", "{id}"],
             readOnly: true,
             note: "Runs interactively — some devices need a reboot",
             // Purely local (reads fwupd's daemon state), so it runs every cycle.
             minIntervalMs: 0,
             defaultOn: true
-        },
-        {
-            id: "mise",
-            label: "mise Tools",
-            icon: "layers",
-            rank: 2,
-            bin: "mise",
-            listCmd: ["mise", "outdated", "--json"],
-            parse: function (text) { return root._parseMise(text); },
-            applyAll: ["mise", "upgrade"],
-            applyOne: function (item) { return ["mise", "upgrade", item.id]; },
-            readOnly: false,
-            note: "",
-            minIntervalMs: 6 * 3600 * 1000,
-            defaultOn: true
-        },
-        {
-            id: "rustup",
-            label: "Rust Toolchains",
-            icon: "code",
-            rank: 3,
-            bin: "rustup",
-            listCmd: ["rustup", "check"],
-            parse: function (text) { return root._parseRustup(text); },
-            applyAll: ["rustup", "update"],
-            applyOne: function (item) { return ["rustup", "update", item.id]; },
-            readOnly: false,
-            note: "",
-            minIntervalMs: 6 * 3600 * 1000,
-            defaultOn: true
         }
     ]
+
+    // ---- User-defined sources -------------------------------------------
+    // Sources the user adds in a JSON file, parsed through the same spec engine
+    // the built-ins now use. They carry their own `enabled` flag rather than a
+    // DMS toggle: toggles have to be declared statically in the settings QML,
+    // and the file is already the place this kind of source is configured.
+    readonly property string extSourcesPath: (Quickshell.env("XDG_CONFIG_HOME")
+        || (Quickshell.env("HOME") + "/.config"))
+        + "/DankMaterialShell/shelly-updater-sources.json"
+    property var extUserProviders: []
+    // Human-readable rejections, surfaced in the updates view. A bad entry is
+    // dropped on its own — one typo must not take the other sources with it.
+    property var extConfigErrors: []
+    property bool extSourcesLoaded: false
+
+    readonly property var extProviders: extBuiltinProviders.concat(extUserProviders)
+
+    readonly property string extSourcesDir: (Quickshell.env("XDG_CONFIG_HOME")
+        || (Quickshell.env("HOME") + "/.config")) + "/DankMaterialShell"
+    readonly property string extSourcesExample:
+        String(Qt.resolvedUrl("examples/shelly-updater-sources.json")).replace(/^file:\/\//, "")
+    property string _extSourcesText: ""
+    property bool _extSeedTried: false
+
+    Process {
+        id: extSourcesProc
+        command: ["cat", root.extSourcesPath]
+        stdout: StdioCollector {
+            onStreamFinished: root._extSourcesText = text || ""
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+        onExited: {
+            // First run has no file (cat exits non-zero, stdout empty). Seed it
+            // from the shipped example so mise and Rust keep working out of the
+            // box now that they live in config rather than in the widget — then
+            // re-read. `cp -n` means an existing file is never touched, so a
+            // user who empties or edits theirs keeps it.
+            if (String(root._extSourcesText).trim() === "" && !root._extSeedTried) {
+                root._extSeedTried = true;
+                extSeedProc.running = true;
+                return;
+            }
+            root._loadUserSources(root._extSourcesText);
+            root.extSourcesLoaded = true;
+            // Detection has to wait for this, or user-defined binaries are
+            // never probed and their sources stay invisible.
+            extDetectProc.running = true;
+        }
+    }
+
+    Process {
+        id: extSeedProc
+        command: ["sh", "-c",
+            "mkdir -p " + _shq(root.extSourcesDir)
+            + " && cp -n " + _shq(root.extSourcesExample) + " " + _shq(root.extSourcesPath)]
+        stdout: StdioCollector { onStreamFinished: {} }
+        stderr: StdioCollector { onStreamFinished: {} }
+        // Whether the copy worked or not, re-read: the second pass proceeds
+        // regardless because _extSeedTried is now set.
+        onExited: extSourcesProc.running = true
+    }
+
+    function _loadUserSources(text) {
+        var t = String(text || "").trim();
+        root.extUserProviders = [];
+        root.extConfigErrors = [];
+        if (t.length === 0)
+            return;
+        var data;
+        try {
+            data = JSON.parse(t);
+        } catch (e) {
+            root.extConfigErrors = ["sources file is not valid JSON — " + String(e)];
+            return;
+        }
+        var list = Array.isArray(data)
+            ? data
+            : ((data && Array.isArray(data.sources)) ? data.sources : null);
+        if (!list) {
+            root.extConfigErrors = ["sources file must be a JSON array of sources, "
+                + "or an object with a \"sources\" array"];
+            return;
+        }
+        // Ids that would collide with something the widget already owns.
+        var taken = ["pacman", "aur", "flatpak", "appimage"];
+        for (var b = 0; b < root.extBuiltinProviders.length; b++)
+            taken.push(root.extBuiltinProviders[b].id);
+
+        var out = [], errs = [];
+        for (var i = 0; i < list.length; i++) {
+            var res = root._validateUserSource(list[i], i, taken);
+            if (res.error) {
+                errs.push(res.error);
+                continue;
+            }
+            // Rank after the built-ins, in file order.
+            res.provider.rank = 100 + i;
+            out.push(res.provider);
+            taken.push(res.provider.id);
+        }
+        root.extUserProviders = out;
+        root.extConfigErrors = errs;
+    }
+
+    // Returns { provider } or { error }. Every rejection names the entry and
+    // says what is wrong with it, because the alternative — a source silently
+    // not appearing — is the worst way to debug a config file.
+    function _validateUserSource(o, idx, taken) {
+        function fail(msg, id) {
+            return { error: "source #" + (idx + 1) + (id ? " (\"" + id + "\")" : "") + ": " + msg };
+        }
+        if (!o || typeof o !== "object" || Array.isArray(o))
+            return fail("must be a JSON object");
+        var id = o.id;
+        if (typeof id !== "string" || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(id))
+            return fail("\"id\" must be a short name starting with a letter (letters, digits, - and _)");
+        if (taken.indexOf(id) !== -1)
+            return fail("id is already used by another source", id);
+        if (typeof o.bin !== "string" || o.bin.trim() === "")
+            return fail("\"bin\" must name the command to look for", id);
+        if (!root._isStringArray(o.listCmd) || o.listCmd.length === 0)
+            return fail("\"listCmd\" must be a non-empty array of strings", id);
+        if (o.applyAll !== undefined && !root._isStringArray(o.applyAll))
+            return fail("\"applyAll\" must be an array of strings", id);
+        if (o.applyOne !== undefined && !root._isStringArray(o.applyOne))
+            return fail("\"applyOne\" must be an array of strings", id);
+
+        var spec = o.parse;
+        if (!spec || typeof spec !== "object")
+            return fail("\"parse\" must be an object with a \"type\"", id);
+        if (spec.type === "regex") {
+            if (typeof spec.pattern !== "string" || spec.pattern === "")
+                return fail("regex parse needs a \"pattern\"", id);
+            try {
+                new RegExp(spec.pattern, spec.flags || "");
+            } catch (e) {
+                return fail("regex \"pattern\" does not compile — " + String(e), id);
+            }
+            if (spec.strip !== undefined) {
+                try {
+                    new RegExp(spec.strip);
+                } catch (e2) {
+                    return fail("regex \"strip\" does not compile — " + String(e2), id);
+                }
+            }
+            if (typeof spec.name !== "number")
+                return fail("regex parse needs \"name\" as a capture-group number", id);
+        } else if (spec.type === "json") {
+            if (typeof spec.name !== "string" || spec.name === "")
+                return fail("json parse needs \"name\" as a field path (or \"$key\")", id);
+        } else {
+            return fail("\"parse.type\" must be \"regex\" or \"json\"", id);
+        }
+
+        var hours = (typeof o.minIntervalHours === "number" && o.minIntervalHours >= 0)
+            ? o.minIntervalHours : 6;
+        return {
+            provider: {
+                id: id,
+                label: (typeof o.label === "string" && o.label !== "") ? o.label : id,
+                icon: (typeof o.icon === "string" && o.icon !== "") ? o.icon : "extension",
+                rank: 100 + idx,
+                bin: o.bin.trim(),
+                listCmd: o.listCmd,
+                parseSpec: spec,
+                applyAll: o.applyAll || null,
+                applyOne: o.applyOne || null,
+                readOnly: o.readOnly === true,
+                note: (typeof o.note === "string") ? o.note : "",
+                minIntervalMs: Math.round(hours * 3600 * 1000),
+                defaultOn: true,
+                userDefined: true,
+                enabled: o.enabled !== false
+            }
+        };
+    }
+
+    function _isStringArray(v) {
+        if (!Array.isArray(v))
+            return false;
+        for (var i = 0; i < v.length; i++)
+            if (typeof v[i] !== "string")
+                return false;
+        return true;
+    }
 
     function extProvider(id) {
         for (var i = 0; i < root.extProviders.length; i++)
@@ -440,6 +607,10 @@ PluginComponent {
     function extEnabled(p) {
         if (!p || !root.extAvailable[p.id])
             return false;
+        // User-defined sources are switched in the file that defines them; only
+        // the built-ins have a settings toggle to consult.
+        if (p.userDefined)
+            return p.enabled !== false;
         var key = "enable" + p.id.charAt(0).toUpperCase() + p.id.slice(1);
         return root._pd[key] !== undefined ? root._pd[key] : p.defaultOn;
     }
@@ -1192,34 +1363,6 @@ PluginComponent {
         };
     }
 
-    // `dms plugins update --all --check` is plain text, one line per plugin:
-    //   "Update available for plugin: I/O Monitor (ID: ioMonitor)"
-    // It carries no versions (DMS plugins are git checkouts, not releases).
-    function _parseDmsPlugins(text) {
-        var out = [];
-        var lines = String(text || "").split("\n");
-        var re = /^Update available for plugin:\s*(.+?)\s*\(ID:\s*([^)]+)\)\s*$/;
-        for (var i = 0; i < lines.length; i++) {
-            var m = re.exec(lines[i].trim());
-            if (!m)
-                continue;
-            var id = m[2].trim();
-            // NEVER offer to update ourselves: `dms plugins update` rewrites the
-            // plugin directory, and DMS reloads the plugin as soon as it
-            // changes — which tears down this very component mid-run. The user
-            // updates shellyUpdater from DMS Settings instead.
-            if (id === root.pluginName)
-                continue;
-            out.push(root._extItem({
-                name: m[1].trim(),
-                id: id,
-                versionText: "update available",
-                source: "dmsPlugins"
-            }));
-        }
-        return out;
-    }
-
     // `fwupdmgr get-updates --json` → {"Devices":[{Name,Version,Releases:[…]}]}.
     // With no updates fwupdmgr prints a non-JSON notice and exits non-zero;
     // both are handled by the caller as "nothing pending", not an error.
@@ -1255,68 +1398,157 @@ PluginComponent {
         return out;
     }
 
-    // `mise outdated --json` → an object keyed by tool name:
-    //   {"node": {"name":"node","current":"20.0.0","latest":"22.0.0", …}}
-    // An array form is accepted too, since the shape has moved between releases.
-    function _parseMise(text) {
-        var trimmed = String(text || "").trim();
-        if (trimmed.length === 0 || "{[".indexOf(trimmed.charAt(0)) === -1)
-            return [];
-        var data = JSON.parse(trimmed);
-        var recs = [];
-        if (Array.isArray(data)) {
-            recs = data;
-        } else {
-            for (var k in data) {
-                var v = data[k] || {};
-                if (v.name === undefined)
-                    v.name = k;
-                recs.push(v);
-            }
+    // ---- Declarative parse specs ----------------------------------------
+    // Sources describe how to read their output instead of shipping code for
+    // it, which is what lets a source be defined in a config file (see
+    // extUserProviders). Two shapes cover every source here and most plausible
+    // ones, because update tools essentially all print either one line per
+    // outdated thing or a JSON collection of them.
+    //
+    //   { type: "regex", pattern, flags?, name, id?, current?, latest?,
+    //     strip?, versionText?, description?, exclude?[] }
+    //     Scans stdout line by line; name/id/current/latest are capture-group
+    //     NUMBERS. `strip` is a second pattern removed from both versions (for
+    //     tools that append build metadata). `exclude` drops matched ids.
+    //
+    //   { type: "json", root?, iterate: "array"|"object", name, id?, current?,
+    //     latest?, description?, require?, versionText? }
+    //     Field values are dotted paths resolved against each record, so
+    //     "Releases.0.Version" reaches into nested arrays. The literal "$key"
+    //     yields the object key when iterating an object. `root` is a dotted
+    //     path to the collection; `require` skips records missing that path.
+
+    // Resolve a dotted path, walking objects and numeric array indices alike.
+    function _specGet(obj, path) {
+        if (path === undefined || path === null || path === "")
+            return undefined;
+        var parts = String(path).split(".");
+        var cur = obj;
+        for (var i = 0; i < parts.length; i++) {
+            if (cur === null || cur === undefined)
+                return undefined;
+            var k = parts[i];
+            cur = (Array.isArray(cur) && /^[0-9]+$/.test(k)) ? cur[parseInt(k)] : cur[k];
         }
+        return cur;
+    }
+
+    function _specStr(v) {
+        return (v === undefined || v === null) ? "" : String(v);
+    }
+
+    function _parseBySpec(spec, text, src) {
+        if (!spec || !spec.type)
+            return [];
+        if (spec.type === "regex")
+            return root._parseRegexSpec(spec, text, src);
+        if (spec.type === "json")
+            return root._parseJsonSpec(spec, text, src);
+        throw new Error("unknown parse type '" + spec.type + "'");
+    }
+
+    function _parseRegexSpec(spec, text, src) {
         var out = [];
-        for (var i = 0; i < recs.length; i++) {
-            var r = recs[i];
-            var cur = r.current || r.installed || "";
-            var latest = r.latest || "";
-            if (latest === "" || latest === cur)
+        var re = new RegExp(spec.pattern, spec.flags || "");
+        var strip = spec.strip ? new RegExp(spec.strip) : null;
+        var exclude = spec.exclude || [];
+        var lines = String(text || "").split("\n");
+        for (var i = 0; i < lines.length; i++) {
+            var m = re.exec(lines[i].trim());
+            if (!m)
                 continue;
+            var g = function (idx) {
+                return (idx === undefined || idx === null) ? "" : String(m[idx] || "").trim();
+            };
+            var name = g(spec.name);
+            var id = (spec.id !== undefined) ? g(spec.id) : name;
+            if (exclude.indexOf(id) !== -1)
+                continue;
+            var cur = g(spec.current), lat = g(spec.latest);
+            if (strip) {
+                cur = cur.replace(strip, "");
+                lat = lat.replace(strip, "");
+            }
             out.push(root._extItem({
-                name: r.name || "",
-                id: r.name || "",
-                oldVersion: cur,
-                newVersion: latest,
-                description: r.requested ? ("requested " + r.requested) : "",
-                source: "mise",
-                raw: r
+                name: name, id: id, oldVersion: cur, newVersion: lat,
+                versionText: spec.versionText || "",
+                description: spec.description || "",
+                source: src, raw: { line: lines[i] }
             }));
         }
         return out;
     }
 
-    // `rustup check` is plain text, one line per toolchain:
-    //   "stable-x86_64-unknown-linux-gnu - update available: 1.96.1 (…) -> 1.98.0 (…)"
-    // Up-to-date toolchains print "- Up to date" and are skipped. It exits 100
-    // when updates exist, which the ext queue already treats as non-fatal.
-    function _parseRustup(text) {
+    function _parseJsonSpec(spec, text, src) {
+        var t = String(text || "").trim();
+        // Tools print a plain-text notice when there is nothing to report, so a
+        // non-JSON body means "none", not a parse failure.
+        if (t.length === 0 || "{[".indexOf(t.charAt(0)) === -1)
+            return [];
+        var data = JSON.parse(t);
+        var coll = spec.root ? root._specGet(data, spec.root) : data;
+        if (coll === undefined || coll === null)
+            return [];
+        var recs = [];
+        if (Array.isArray(coll)) {
+            for (var i = 0; i < coll.length; i++)
+                recs.push({ key: String(i), val: coll[i] });
+        } else {
+            for (var k in coll)
+                recs.push({ key: k, val: coll[k] });
+        }
         var out = [];
-        var lines = String(text || "").split("\n");
-        var re = /^(\S+)\s+-\s+update available:\s*(.+?)\s*->\s*(.+?)\s*$/;
-        for (var i = 0; i < lines.length; i++) {
-            var m = re.exec(lines[i].trim());
-            if (!m)
+        for (var j = 0; j < recs.length; j++) {
+            var rec = recs[j];
+            if (spec.require && root._specStr(root._specGet(rec.val, spec.require)) === "")
                 continue;
-            // Strip the "(hash date)" suffix rustup appends to each version.
-            var strip = function (v) { return v.replace(/\s*\(.*\)\s*$/, ""); };
+            var f = function (path) {
+                if (path === "$key")
+                    return rec.key;
+                return root._specStr(root._specGet(rec.val, path));
+            };
+            var name = f(spec.name);
+            var cur = f(spec.current), lat = f(spec.latest);
+            // A record that reports no newer version is not an update.
+            if (spec.latest && lat !== "" && lat === cur)
+                continue;
             out.push(root._extItem({
-                name: m[1],
-                id: m[1],
-                oldVersion: strip(m[2]),
-                newVersion: strip(m[3]),
-                source: "rustup"
+                name: name,
+                id: (spec.id !== undefined) ? f(spec.id) : name,
+                oldVersion: cur, newVersion: lat,
+                versionText: spec.versionText || "",
+                description: f(spec.description),
+                source: src, raw: rec.val
             }));
         }
         return out;
+    }
+
+    // A provider parses either through its spec or, for the one built-in whose
+    // shape the spec cannot express, its own function.
+    function _providerParse(p, text) {
+        if (typeof p.parse === "function")
+            return p.parse(text) || [];
+        if (p.parseSpec)
+            return root._parseBySpec(p.parseSpec, text, p.id) || [];
+        return [];
+    }
+
+    // Build a per-item apply command. Config-defined sources give an argv
+    // template with {id}/{name}/{current}/{latest} placeholders; built-ins may
+    // still supply a function.
+    function _applyOneArgv(p, item) {
+        if (!p || !p.applyOne)
+            return null;
+        if (typeof p.applyOne === "function")
+            return p.applyOne(item);
+        return p.applyOne.map(function (a) {
+            return String(a)
+                .replace(/\{id\}/g, item.id || "")
+                .replace(/\{name\}/g, item.name || "")
+                .replace(/\{current\}/g, item.oldVersion || "")
+                .replace(/\{latest\}/g, item.newVersion || "");
+        });
     }
 
     // ---- External provider probing & checking ---------------------------
@@ -1507,7 +1739,7 @@ PluginComponent {
             if (!p)
                 continue;
             try {
-                next[id] = p.parse(chunk.substring(nl + 1)) || [];
+                next[id] = root._providerParse(p, chunk.substring(nl + 1));
             } catch (e) {
                 // A broken external source must never take down the Shelly
                 // counts — drop its results and keep going.
@@ -1760,9 +1992,10 @@ PluginComponent {
         // terminal open so the tool's own prompts and output stay readable.
         var ext = root.extProvider(item.source);
         if (ext) {
-            if (!ext.applyOne)
+            var argv = root._applyOneArgv(ext, item);
+            if (!argv || argv.length === 0)
                 return;
-            root._runTerminalShell(ext.applyOne(item).join(" "), item.name, true);
+            root._runTerminalShell(argv.map(_shq).join(" "), item.name, true);
             return;
         }
         // Shelly v3 grammar: `update <type> <name>` (was `<type> update <name>`).
@@ -2879,7 +3112,7 @@ PluginComponent {
         envProc.running = true; // detect {environment} for AI prompts
         shellyVerProc.running = true; // detect Shelly major version (v3+ required)
         newsProc.running = true; // fetch Arch news for the pre-update banner
-        extDetectProc.running = true; // which external provider binaries exist
+        extSourcesProc.running = true; // user sources, then binary detection
         // pluginService is usually NULL here (assigned after) — _loadPersistedState
         // no-ops then and re-runs from onPluginServiceChanged below.
         _loadPersistedState();
@@ -3624,6 +3857,71 @@ PluginComponent {
                 spacing: Theme.spacingXS
                 FailBannerButton { icon: "troubleshoot"; label: "Details"; onClicked: root.openFailures(false) }
                 FailBannerButton { icon: "description"; label: "Log"; onClicked: root.viewLastLog() }
+            }
+        }
+
+        // Rejected entries from the user's sources file. Shown here rather than
+        // folded into the widget's error state: a typo in an optional config
+        // file should not make the pill look like the system is broken, but it
+        // must not vanish either — a source that silently never appears is the
+        // worst possible way to debug that file.
+        Column {
+            width: uv.contentWidth
+            visible: !uv.embedded && root.extConfigErrors.length > 0
+            spacing: Theme.spacingXS
+
+            Rectangle {
+                width: parent.width
+                radius: Theme.cornerRadius
+                color: Theme.withAlpha(Theme.error, 0.10)
+                border.width: 1
+                border.color: Theme.withAlpha(Theme.error, 0.35)
+                height: cfgErrCol.implicitHeight + Theme.spacingM * 2
+                Column {
+                    id: cfgErrCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.margins: Theme.spacingM
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+                    Row {
+                        spacing: Theme.spacingS
+                        DankIcon {
+                            anchors.verticalCenter: parent.verticalCenter
+                            name: "error"
+                            size: Theme.iconSize - 4
+                            color: Theme.error
+                        }
+                        StyledText {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.extConfigErrors.length === 1
+                                ? "1 update source was skipped"
+                                : root.extConfigErrors.length + " update sources were skipped"
+                            font.pixelSize: Theme.fontSizeSmall
+                            font.weight: Font.Medium
+                            color: Theme.error
+                        }
+                    }
+                    Repeater {
+                        model: root.extConfigErrors
+                        StyledText {
+                            required property var modelData
+                            width: cfgErrCol.width
+                            text: "• " + modelData
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                    StyledText {
+                        width: cfgErrCol.width
+                        text: root.extSourcesPath
+                        font.family: "monospace"
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.surfaceVariantText
+                        wrapMode: Text.WrapAnywhere
+                    }
+                }
             }
         }
 

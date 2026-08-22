@@ -38,7 +38,12 @@ and **Rust toolchains**.
   - **Device firmware** (`fwupdmgr`) — fwupd/LVFS updates. **Listing only**: firmware is never applied
     silently and is never swept up by *Update All*. Applying it always opens a terminal and runs
     `fwupdmgr`'s own prompts, because a bad flash is the one update here that can brick hardware
-  - **mise tools** (`mise`) and **Rust toolchains** (`rustup`)
+  - **mise tools** (`mise`) and **Rust toolchains** (`rustup`) — these two ship as entries in the
+    sources file rather than being baked in, so they double as worked examples
+- **Add your own sources without writing code** — any tool that can list what's outdated can be
+  described in `~/.config/DankMaterialShell/shelly-updater-sources.json`: the command to run, how
+  to read its output (a regex or a JSON field map), and how to apply an update. See
+  [Adding your own sources](#adding-your-own-sources)
 - Configurable automatic checks (15 min, 30 min, 1 hr, 4 hr, once a day) and check-at-startup
 - **Updates view** (default left click) — every pending update grouped with descriptions and
   download size, an **Update All** button, and a per-item update button
@@ -142,12 +147,12 @@ The extra sources are **descriptors, not special cases** — one table entry def
 source's command, parser, apply action and staleness window, so adding another is a
 few lines rather than a new code path.
 
-| Source      | Check command                        | Apply command                |
-|-------------|--------------------------------------|------------------------------|
-| DMS plugins | `dms plugins update --all --check`   | `dms plugins update --all`   |
-| Firmware    | `fwupdmgr get-updates --json`        | `fwupdmgr update` *(manual)* |
-| mise        | `mise outdated --json`               | `mise upgrade`               |
-| rustup      | `rustup check`                       | `rustup update`              |
+| Source      | Check command                        | Apply command                | Defined in |
+|-------------|--------------------------------------|------------------------------|------------|
+| DMS plugins | `dms plugins update --all --check`   | `dms plugins update --all`   | built in   |
+| Firmware    | `fwupdmgr get-updates --json`        | `fwupdmgr update` *(manual)* | built in   |
+| mise        | `mise outdated --json`               | `mise upgrade`               | config     |
+| rustup      | `rustup check`                       | `rustup update`              | config     |
 
 Two things make this safe to leave on:
 
@@ -162,6 +167,76 @@ Two things make this safe to leave on:
 
 Each source disappears entirely when its command isn't installed, so an unused toggle
 costs nothing.
+
+### Adding your own sources
+
+Extra sources live in `~/.config/DankMaterialShell/shelly-updater-sources.json`, seeded on first
+run from [`examples/shelly-updater-sources.json`](examples/shelly-updater-sources.json). An
+existing file is never overwritten, so your edits survive upgrades. Reload after editing:
+
+```sh
+dms ipc call plugins reload shellyUpdater
+```
+
+> ⚠️ **`listCmd`, `applyAll` and `applyOne` are executed as you.** Treat a sources file from
+> someone else exactly like a shell script from someone else.
+
+A source names a command, says how to read its output, and says how to apply an update:
+
+```json
+{
+  "id": "npmGlobal",
+  "label": "npm (global)",
+  "icon": "javascript",
+  "bin": "npm",
+  "listCmd": ["npm", "--global", "outdated", "--json"],
+  "parse": { "type": "json", "iterate": "object",
+             "name": "$key", "current": "current", "latest": "latest" },
+  "applyAll": ["npm", "--global", "update"],
+  "applyOne": ["npm", "--global", "install", "{id}@latest"],
+  "minIntervalHours": 12,
+  "enabled": true
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Short unique name; also the chip label. Can't collide with a built-in source |
+| `bin` | Command that must exist — if it doesn't, the source is hidden entirely |
+| `listCmd` | argv that prints what's outdated |
+| `parse` | How to read that output (below) |
+| `applyAll` | argv updating everything. Omit to make the source listing-only |
+| `applyOne` | argv updating one item; `{id}` `{name}` `{current}` `{latest}` are substituted |
+| `minIntervalHours` | How long results stay cached. Keep this high for anything hitting the network (default 6) |
+| `readOnly` | `true` = never applied in-widget or by *Update All*, only handed to a terminal |
+| `note` | One-line caveat shown under the menu row |
+| `enabled` | `false` keeps an entry on file without using it |
+
+**Two parse shapes** cover essentially every update tool, because they all print either one line
+per outdated thing or a JSON collection of them:
+
+```json
+{ "type": "regex", "pattern": "^(\\S+) - update available: (.+?) -> (.+)$",
+  "name": 1, "current": 2, "latest": 3, "strip": "\\s*\\(.*\\)\\s*$" }
+```
+Scans stdout line by line; `name` / `id` / `current` / `latest` are capture-group **numbers**.
+`strip` is a second pattern removed from both versions (for tools that append build metadata),
+and `exclude` drops matching ids.
+
+```json
+{ "type": "json", "root": "Devices", "iterate": "array",
+  "name": "Name", "current": "Version", "latest": "Releases.0.Version",
+  "require": "Releases.0.Version" }
+```
+Field values are **dotted paths** resolved per record, so `Releases.0.Version` reaches into
+nested arrays. `$key` yields the object key when iterating an object, `root` is a path to the
+collection, and `require` skips records missing that path. Records whose `latest` equals their
+`current` are dropped automatically.
+
+A bad entry is skipped **on its own** — one typo can't take the other sources down — and the
+reason appears in the updates view, naming the entry and what's wrong with it. A source whose
+`bin` isn't installed is skipped silently, which is what makes it safe to keep entries on file
+for tools you only have on some machines.
 
 ### Logo assets
 

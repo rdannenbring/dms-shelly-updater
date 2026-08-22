@@ -560,17 +560,20 @@ PluginSettings {
             description: "Include firmware updates reported by fwupd/LVFS (needs 'fwupdmgr'). Listing only — firmware is never applied silently or as part of Update All; it always opens a terminal and runs fwupdmgr's own prompts."
             defaultValue: true
         }
-        ToggleSetting {
-            settingKey: "enableMise"
-            label: "mise tools"
-            description: "Include outdated runtimes and tools managed by mise (needs 'mise')."
-            defaultValue: true
+        SectionHeader {
+            title: "Your own sources"
+            subtitle: "Any other tool that can list what's outdated can be added without touching code. mise and Rust toolchains ship as entries in this file — copy one as a starting point. Reload the plugin after editing."
         }
-        ToggleSetting {
-            settingKey: "enableRustup"
-            label: "Rust toolchains"
-            description: "Include Rust toolchain updates reported by rustup (needs 'rustup')."
-            defaultValue: true
+        CopyableCommand {
+            command: "~/.config/DankMaterialShell/shelly-updater-sources.json"
+            copyText: "~/.config/DankMaterialShell/shelly-updater-sources.json"
+        }
+        StyledText {
+            width: parent.width
+            text: "Each entry names a command to run, how to read its output (a regex or a JSON field map), and how to apply an update. Entries whose command isn't installed are skipped silently; entries with mistakes in them are skipped with the reason shown in the updates view. Because these run commands as you, treat a sources file from someone else the way you'd treat their shell script."
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
         }
     }
 
