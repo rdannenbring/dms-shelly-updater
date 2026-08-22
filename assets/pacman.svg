@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Original artwork: a generic "chomping disc" for the pacman package
+       manager. Plain geometry (a circle with a wedge removed plus a pellet
+       row), not traced from any game asset. -->
+  <path fill="#FFC803" d="M128 20a108 108 0 1 0 0 216 108 108 0 0 0 93.5-54L128 128l93.5-54A107.7 107.7 0 0 0 128 20Z"/>
+  <circle fill="#FFC803" cx="196" cy="128" r="15"/>
+  <circle fill="#FFC803" cx="240" cy="128" r="11"/>
+</svg>

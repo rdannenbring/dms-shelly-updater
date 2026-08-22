@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- AppImage mark redrawn as a single-colour plate with the arrow and cog
+       knocked OUT as negative space (fill-rule evenodd) rather than drawn on
+       top in their own colours. That makes it flat-tintable like every other
+       mark here, so it takes the accent exactly instead of being
+       luminance-mapped and landing a shade off from its neighbours. -->
+  <path fill="#6E8FA8" fill-rule="evenodd" d="M60,20 L196,20 A40,40 0 0 1 236,60 L236,196 A40,40 0 0 1 196,236 L60,236 A40,40 0 0 1 20,196 L20,60 A40,40 0 0 1 60,20 Z M113,50 L143,50 L143,104 L172,104 L128,156 L84,104 L113,104 Z M173.7,188.6 L173.7,199.4 L159.8,203.0 L156.8,210.1 L164.1,222.5 L156.5,230.1 L144.1,222.8 L137.0,225.8 L133.4,239.7 L122.6,239.7 L119.0,225.8 L111.9,222.8 L99.5,230.1 L91.9,222.5 L99.2,210.1 L96.2,203.0 L82.3,199.4 L82.3,188.6 L96.2,185.0 L99.2,177.9 L91.9,165.5 L99.5,157.9 L111.9,165.2 L119.0,162.2 L122.6,148.3 L133.4,148.3 L137.0,162.2 L144.1,165.2 L156.5,157.9 L164.1,165.5 L156.8,177.9 L159.8,185.0 Z M143,194 A15,15 0 1 0 113,194 A15,15 0 1 0 143,194 Z"/>
+</svg>

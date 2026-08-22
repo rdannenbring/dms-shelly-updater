@@ -543,6 +543,35 @@ PluginSettings {
         }
         ToggleSetting { settingKey: "enableFlatpak"; label: "Flatpak"; description: "Include Flatpak applications."; defaultValue: true }
         ToggleSetting { settingKey: "enableAppimage"; label: "AppImage"; description: "Include AppImages managed by Shelly."; defaultValue: false }
+
+        SectionHeader {
+            title: "Beyond Shelly"
+            subtitle: "Extra update sources that Shelly doesn't manage. Each one is skipped automatically when its command isn't installed, so leaving it on costs nothing."
+        }
+        ToggleSetting {
+            settingKey: "enableDmsPlugins"
+            label: "DMS plugins"
+            description: "Include updates to your installed DankMaterialShell plugins (needs the 'dms' CLI). Shelly Updater never updates itself this way — use Settings → Plugins for that."
+            defaultValue: true
+        }
+        ToggleSetting {
+            settingKey: "enableFirmware"
+            label: "Device firmware"
+            description: "Include firmware updates reported by fwupd/LVFS (needs 'fwupdmgr'). Listing only — firmware is never applied silently or as part of Update All; it always opens a terminal and runs fwupdmgr's own prompts."
+            defaultValue: true
+        }
+        ToggleSetting {
+            settingKey: "enableMise"
+            label: "mise tools"
+            description: "Include outdated runtimes and tools managed by mise (needs 'mise')."
+            defaultValue: true
+        }
+        ToggleSetting {
+            settingKey: "enableRustup"
+            label: "Rust toolchains"
+            description: "Include Rust toolchain updates reported by rustup (needs 'rustup')."
+            defaultValue: true
+        }
     }
 
     // ==== Tab 4: Look (Appearance / Detailed View / Tooltip) ============
@@ -552,6 +581,12 @@ PluginSettings {
         spacing: Theme.spacingM
 
         SectionHeader { title: "Appearance" }
+        ToggleSetting {
+            settingKey: "tintSourceLogos"
+            label: "Tint icons with theme color"
+            description: "Draw the menu and update-row icons in your theme's accent color — both the source logos (Pacman, Arch, Flatpak, AppImage, Dank, mise, Rust) and the plain symbols beside them, so the menu reads as one palette. Turn off for brand-colored logos and neutral symbols."
+            defaultValue: true
+        }
         IconSetting {
             settingKey: "iconDefault"
             label: "Icon — up to date"
