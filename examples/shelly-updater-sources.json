@@ -14,7 +14,7 @@
     "  icon              Material Symbol name (fonts.google.com/icons)",
     "  bin               command that must exist, else the source is hidden entirely",
     "  listCmd           argv that prints what is outdated",
-    "  parse             how to read that output — see the two forms below",
+    "  parse             how to read that output \u2014 see the two forms below",
     "  applyAll          argv updating everything (omit to make the source read-only)",
     "  applyOne          argv updating one item; {id} {name} {current} {latest}",
     "  minIntervalHours  how long results stay cached (network sources: keep this high)",
@@ -22,19 +22,24 @@
     "  note              one-line caveat shown under the menu row",
     "  enabled           false to keep an entry without using it",
     "",
+    "  env               NAME: value pairs prepended to the command; values may use $HOME/$PATH.",
+    "                    Needed for version-manager tools (nvm, pyenv, asdf) \u2014 see npmGlobal.",
     "parse: { type: 'regex', pattern, flags?, name, id?, current?, latest?,",
-    "         strip?, versionText?, exclude?[] }   — capture-group NUMBERS",
+    "         strip?, versionText?, exclude?[] }   \u2014 capture-group NUMBERS",
     "parse: { type: 'json', root?, iterate, name, id?, current?, latest?,",
-    "         description?, require? }             — dotted paths; '$key' = object key"
+    "         description?, require? }             \u2014 dotted paths; '$key' = object key"
   ],
-
   "sources": [
     {
       "id": "mise",
       "label": "mise Tools",
       "icon": "layers",
       "bin": "mise",
-      "listCmd": ["mise", "outdated", "--json"],
+      "listCmd": [
+        "mise",
+        "outdated",
+        "--json"
+      ],
       "parse": {
         "type": "json",
         "iterate": "object",
@@ -42,8 +47,15 @@
         "current": "current",
         "latest": "latest"
       },
-      "applyAll": ["mise", "upgrade"],
-      "applyOne": ["mise", "upgrade", "{id}"],
+      "applyAll": [
+        "mise",
+        "upgrade"
+      ],
+      "applyOne": [
+        "mise",
+        "upgrade",
+        "{id}"
+      ],
       "minIntervalHours": 6,
       "enabled": true
     },
@@ -52,7 +64,10 @@
       "label": "Rust Toolchains",
       "icon": "code",
       "bin": "rustup",
-      "listCmd": ["rustup", "check"],
+      "listCmd": [
+        "rustup",
+        "check"
+      ],
       "parse": {
         "type": "regex",
         "pattern": "^(\\S+)\\s+-\\s+update available:\\s*(.+?)\\s*->\\s*(.+?)\\s*$",
@@ -61,8 +76,15 @@
         "latest": 3,
         "strip": "\\s*\\(.*\\)\\s*$"
       },
-      "applyAll": ["rustup", "update"],
-      "applyOne": ["rustup", "update", "{id}"],
+      "applyAll": [
+        "rustup",
+        "update"
+      ],
+      "applyOne": [
+        "rustup",
+        "update",
+        "{id}"
+      ],
       "minIntervalHours": 6,
       "enabled": true
     },
@@ -71,7 +93,12 @@
       "label": "npm (global)",
       "icon": "javascript",
       "bin": "npm",
-      "listCmd": ["npm", "--global", "outdated", "--json"],
+      "listCmd": [
+        "npm",
+        "--global",
+        "outdated",
+        "--json"
+      ],
       "parse": {
         "type": "json",
         "iterate": "object",
@@ -79,17 +106,35 @@
         "current": "current",
         "latest": "latest"
       },
-      "applyAll": ["npm", "--global", "update"],
-      "applyOne": ["npm", "--global", "install", "{id}@latest"],
+      "applyAll": [
+        "npm",
+        "--global",
+        "update"
+      ],
+      "applyOne": [
+        "npm",
+        "--global",
+        "install",
+        "{id}@latest"
+      ],
       "minIntervalHours": 12,
-      "enabled": false
+      "enabled": false,
+      "env": {
+        "PATH": "$HOME/.config/nvm/versions/node/v24.14.0/bin:$PATH"
+      },
+      "_note": "env pins the toolchain. The widget's commands run in the DMS service environment, NOT your shell \u2014 so an nvm/pyenv/asdf-managed tool otherwise resolves to a different install than the one you use, and you get updates reported for packages you never touch. Point PATH at your own node bin dir (and update it when you change node versions). Delete this env block if your npm is system-wide. Keep values simple: they are emitted inside double quotes, so $HOME and $PATH expand but nested quoting will not work."
     },
     {
       "id": "flrepo",
       "label": "Flatpak (unmanaged remotes)",
       "icon": "deployed_code_update",
       "bin": "flatpak",
-      "listCmd": ["flatpak", "remote-ls", "--updates", "--columns=application,version"],
+      "listCmd": [
+        "flatpak",
+        "remote-ls",
+        "--updates",
+        "--columns=application,version"
+      ],
       "parse": {
         "type": "regex",
         "pattern": "^(\\S+)\\s+(\\S+)$",
@@ -97,7 +142,7 @@
         "latest": 2
       },
       "readOnly": true,
-      "note": "Listing only — apply through Shelly's Flatpak source",
+      "note": "Listing only \u2014 apply through Shelly's Flatpak source",
       "minIntervalHours": 6,
       "enabled": false
     }

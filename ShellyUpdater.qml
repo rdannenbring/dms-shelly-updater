@@ -558,6 +558,13 @@ PluginComponent {
             return fail("\"parse.type\" must be \"regex\" or \"json\"", id);
         }
 
+        if (o.env !== undefined) {
+            if (typeof o.env !== "object" || Array.isArray(o.env) || o.env === null)
+                return fail("\"env\" must be an object of NAME: value strings", id);
+            for (var ek in o.env)
+                if (typeof o.env[ek] !== "string")
+                    return fail("\"env." + ek + "\" must be a string", id);
+        }
         var hours = (typeof o.minIntervalHours === "number" && o.minIntervalHours >= 0)
             ? o.minIntervalHours : 6;
         return {
@@ -568,6 +575,7 @@ PluginComponent {
                 rank: 100 + idx,
                 bin: o.bin.trim(),
                 listCmd: o.listCmd,
+                env: o.env || null,
                 parseSpec: spec,
                 applyAll: o.applyAll || null,
                 applyOne: o.applyOne || null,
@@ -1217,6 +1225,12 @@ PluginComponent {
     function _doRefresh(isBackground) {
         if (isChecking || isUpgrading)
             return;
+        // A refresh the user asked for means "check now, really": drop the
+        // staleness stamps so cached sources actually re-run. Without this the
+        // refresh button silently does nothing for them, which is the same
+        // complaint as an item lingering after it was updated elsewhere.
+        if (isBackground !== true)
+            root._invalidateExtStamps(root.extActiveProviders.map(function (p) { return p.id; }));
         // External providers are independent of Shelly, so they are kicked off
         // BEFORE the version gate below — an outdated shelly shouldn't blind the
         // widget to plugin or firmware updates too.
@@ -1623,6 +1637,41 @@ PluginComponent {
         };
     }
 
+    // Environment overrides for a source, as a shell assignment prefix.
+    //
+    // This exists because the widget's commands do NOT run in your shell. A
+    // plugin Process inherits the DMS service environment, which has no
+    // ~/.zshrc in it — so a toolchain installed by a version manager (nvm,
+    // pyenv, rbenv, asdf) resolves to a DIFFERENT install here than the one you
+    // use in a terminal, and the widget ends up reporting updates for a package
+    // set you never touch. Values are emitted double-quoted so they can refer
+    // to $PATH and $HOME, which is the whole point of the feature.
+    function _envPrefix(p) {
+        if (!p || !p.env)
+            return "";
+        var parts = [];
+        for (var k in p.env)
+            parts.push(k + "=\"" + String(p.env[k]).replace(/"/g, "\\\"") + "\"");
+        return parts.length ? parts.join(" ") + " " : "";
+    }
+
+    // Applying an update makes that source's cached result wrong immediately,
+    // but its stamp still says "checked recently", so the next refresh skips it
+    // and the item sits in the list for up to minIntervalHours AFTER it was
+    // actually updated. Dropping the stamp forces a real re-check on the
+    // refresh that follows the run.
+    Process { id: extStampProc }
+    function _invalidateExtStamps(ids) {
+        if (!ids || ids.length === 0)
+            return;
+        var parts = [];
+        for (var i = 0; i < ids.length; i++)
+            parts.push(_shq(root._extPaths(ids[i]).stamp));
+        extStampProc.running = false;
+        extStampProc.command = ["sh", "-c", "rm -f " + parts.join(" ")];
+        extStampProc.running = true;
+    }
+
     // The refresh script: stamp check, run, atomic write, stamp — per provider,
     // all inside one lock so concurrent instances don't duplicate the work.
     function _extRefreshScript() {
@@ -1635,7 +1684,7 @@ PluginComponent {
             var f = root._extPaths(p.id);
             var qOut = _shq(f.out);
             var qStamp = _shq(f.stamp);
-            var cmd = p.listCmd.map(_shq).join(" ");
+            var cmd = root._envPrefix(p) + p.listCmd.map(_shq).join(" ");
             var run = cmd + " > " + _shq(f.out + ".tmp") + " 2>/dev/null; "
                 + "mv -f " + _shq(f.out + ".tmp") + " " + qOut + "; "
                 + "touch " + qStamp + ";";
@@ -1958,8 +2007,10 @@ PluginComponent {
         // doesn't cancel the rest — they're independent of each other.
         var cmd = root._lockedCmd(args.join(" "));
         var sweep = root.extSweepProviders;
+        root._invalidateExtStamps(sweep.map(function (sp) { return sp.id; }));
         for (var i = 0; i < sweep.length; i++)
-            cmd += "; echo; echo '── " + sweep[i].label + " ──'; " + sweep[i].applyAll.join(" ");
+            cmd += "; echo; echo '── " + sweep[i].label + " ──'; "
+                + root._envPrefix(sweep[i]) + sweep[i].applyAll.map(_shq).join(" ");
         root._runTerminalShell(cmd, "Update All", false);
     }
 
@@ -1967,7 +2018,8 @@ PluginComponent {
     function updateExt(p) {
         if (!p || !p.applyAll)
             return;
-        root._runTerminalShell(p.applyAll.join(" "), p.label, true);
+        root._invalidateExtStamps([p.id]);
+        root._runTerminalShell(root._envPrefix(p) + p.applyAll.map(_shq).join(" "), p.label, true);
     }
     function updatePacman() {
         _beginUpgrade(_namesOf(pacmanUpdatesShown));
@@ -1995,7 +2047,8 @@ PluginComponent {
             var argv = root._applyOneArgv(ext, item);
             if (!argv || argv.length === 0)
                 return;
-            root._runTerminalShell(argv.map(_shq).join(" "), item.name, true);
+            root._invalidateExtStamps([ext.id]);
+            root._runTerminalShell(root._envPrefix(ext) + argv.map(_shq).join(" "), item.name, true);
             return;
         }
         // Shelly v3 grammar: `update <type> <name>` (was `<type> update <name>`).
@@ -4200,7 +4253,13 @@ PluginComponent {
                                         return modelData.description
                                             ? modelData.versionText + "  ·  " + modelData.description
                                             : modelData.versionText;
-                                    var v = (modelData.oldVersion || "?") + " → " + (modelData.newVersion || "?");
+                                    // Some tools report only the available
+                                    // version (npm omits `current` for a
+                                    // partially-installed global), and "? → x"
+                                    // reads like an error rather than a fact.
+                                    var v = modelData.oldVersion
+                                        ? (modelData.oldVersion + " → " + (modelData.newVersion || "?"))
+                                        : (modelData.newVersion ? ("→ " + modelData.newVersion) : "update available");
                                     var ds = Number(modelData.downloadSize) || 0;
                                     if (ds > 0)
                                         v += "  ·  " + root._fmtBytes(ds);

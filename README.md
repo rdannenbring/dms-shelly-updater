@@ -207,6 +207,7 @@ A source names a command, says how to read its output, and says how to apply an 
 | `parse` | How to read that output (below) |
 | `applyAll` | argv updating everything. Omit to make the source listing-only |
 | `applyOne` | argv updating one item; `{id}` `{name}` `{current}` `{latest}` are substituted |
+| `env` | `NAME: value` pairs prepended to the command. Values are emitted inside double quotes, so `$HOME` and `$PATH` expand — keep them simple, nested quoting won't work |
 | `minIntervalHours` | How long results stay cached. Keep this high for anything hitting the network (default 6) |
 | `readOnly` | `true` = never applied in-widget or by *Update All*, only handed to a terminal |
 | `note` | One-line caveat shown under the menu row |
@@ -232,6 +233,27 @@ Field values are **dotted paths** resolved per record, so `Releases.0.Version` r
 nested arrays. `$key` yields the object key when iterating an object, `root` is a path to the
 collection, and `require` skips records missing that path. Records whose `latest` equals their
 `current` are dropped automatically.
+
+#### Your shell's environment is not the widget's
+
+The commands above run in the **DMS service environment**, not in your shell — nothing sources
+your `~/.zshrc`. For system-wide tools that's fine. For anything installed by a version manager
+(nvm, pyenv, rbenv, asdf) it is not: the widget resolves a *different* install than your terminal
+does, and you get updates reported for a package set you never touch.
+
+The symptom is distinctive: **you update something, it succeeds, and it's still listed.**
+
+Fix it by pinning the toolchain with `env`, which applies to both the check and the apply so the
+two can't disagree:
+
+```json
+"env": { "PATH": "$HOME/.config/nvm/versions/node/v24.14.0/bin:$PATH" }
+```
+
+The shipped `npmGlobal` example does this. Point it at your own bin directory, and update it when
+you change node versions. Avoid globbing the version out (`.../node/*/bin`) — values are emitted
+inside double quotes, so the inner quoting a glob needs doesn't survive, and a glob that matches
+nothing silently leaves an empty entry on `PATH`.
 
 A bad entry is skipped **on its own** — one typo can't take the other sources down — and the
 reason appears in the updates view, naming the entry and what's wrong with it. A source whose
