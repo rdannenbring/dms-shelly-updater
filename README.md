@@ -6,9 +6,14 @@ A comprehensive system-update widget for [DankMaterialShell](https://github.com/
 backed by the [Shelly (ALPM)](https://github.com/Seafoam-Labs/Shelly-ALPM) CLI.
 
 It unifies **pacman**, **AUR**, **Flatpak** and **AppImage** updates into a single
-DankBar pill with a detailed updates view and an action menu — and optionally folds in
-sources Shelly doesn't manage at all: **DMS plugins**, **device firmware**, **mise** tools
-and **Rust toolchains**.
+DankBar pill with a detailed updates view and an action menu.
+
+It also counts things Shelly doesn't manage. **DMS plugins** and **device firmware** are
+built in and have their own settings toggles. Everything else is **defined in a config
+file** — no code, no rebuild: name a command that lists what's outdated, say how to read
+its output, say how to apply an update. The shipped config comes with **mise** and
+**Rust toolchains** enabled, plus **npm globals** and a **Flatpak remote** entry switched
+off as worked examples to copy. See [Adding your own sources](#adding-your-own-sources).
 
 > ⚠️ **Requires Shelly v3 or newer.** Shelly 3.0 reworked its command-line grammar
 > (`shelly <verb> <type>` instead of `shelly <type> <verb>`), which **breaks plugin
@@ -31,19 +36,24 @@ and **Rust toolchains**.
 
 - One pill for all update sources (pacman always on; AUR / Flatpak / AppImage toggleable),
   with an option to exclude devel / `-git` AUR packages
-- **Beyond Shelly** — optional extra sources, each on by default and each auto-hidden when its
-  command isn't installed, so the pill counts everything you actually need to update:
-  - **DMS plugins** (`dms`) — updates to your installed DankMaterialShell plugins. Shelly Updater
-    deliberately excludes *itself* here, since updating a plugin reloads it mid-run
+- **Two built-in non-Shelly sources**, each with its own settings toggle, on by default, and each
+  hidden automatically when its command isn't installed:
+  - **DMS plugins** (`dms`) — updates to your installed DankMaterialShell plugins. Plugins you're
+    *developing* are skipped by default (**Ignore plugins you're developing**): a symlinked plugin
+    folder is a local checkout following your own fork or branch, so it can never match what the
+    registry compares it against and would sit in the list permanently, reported as updatable but
+    impossible to update. That also covers Shelly Updater itself, which is symlinked while you work
+    on it — and updating a plugin reloads it mid-run anyway
   - **Device firmware** (`fwupdmgr`) — fwupd/LVFS updates. **Listing only**: firmware is never applied
     silently and is never swept up by *Update All*. Applying it always opens a terminal and runs
     `fwupdmgr`'s own prompts, because a bad flash is the one update here that can brick hardware
-  - **mise tools** (`mise`) and **Rust toolchains** (`rustup`) — these two ship as entries in the
-    sources file rather than being baked in, so they double as worked examples
-- **Add your own sources without writing code** — any tool that can list what's outdated can be
-  described in `~/.config/DankMaterialShell/shelly-updater-sources.json`: the command to run, how
-  to read its output (a regex or a JSON field map), and how to apply an update. See
-  [Adding your own sources](#adding-your-own-sources)
+- **Any other source, defined in config** — `~/.config/DankMaterialShell/shelly-updater-sources.json`
+  describes a source with a command, a way to read its output (a regex or a JSON field map), and a
+  way to apply an update. These have no settings toggle: the file *is* their configuration, and each
+  entry carries its own `enabled` flag. Entries whose command isn't installed are skipped silently,
+  so a file can safely cover tools you only have on some machines. Ships with **mise** and **rustup**
+  enabled, and **npm globals** plus a **Flatpak remote** entry disabled as templates.
+  See [Adding your own sources](#adding-your-own-sources)
 - Configurable automatic checks (15 min, 30 min, 1 hr, 4 hr, once a day) and check-at-startup
 - **Updates view** (default left click) — every pending update grouped with descriptions and
   download size, an **Update All** button, and a per-item update button
@@ -52,8 +62,13 @@ and **Rust toolchains**.
   - Click a package for an extended **detail view** (info, clickable URL, hold/unhold,
     downgrade, update-this-package); right-click a pacman/AUR row to **hold** (ignore) it
 - **Menu** (default right click) — Update All, Update System (Pacman), Update AUR / Flatpak /
-  AppImage (hidden when disabled), **Held Packages**, **Update History**, Clean Package Cache, Remove Orphans,
+  AppImage (hidden when disabled), one row per enabled non-Shelly source, **Held Packages**, **Update History**, Clean Package Cache, Remove Orphans,
   Open Shelly UI, **Reset** (clear a stuck refresh/upgrade state), and Settings
+- **Hold anything** — right-click an update (or use **Hold** in its details) to pin it out of the
+  count and list. pacman and AUR packages go through `shelly mark ignore`; everything else is held
+  locally by the plugin. Useful for a source that keeps reporting something it can't actually
+  apply — a plugin checked out on a feature branch, say. All of them appear together under
+  **Held Packages**, unholdable in one click
 - **Update History** — successful upgrades/downgrades (from `/var/log/pacman.log`) merged with
   the plugin's own failed-update log; text filter, sort by date or name, and a **failed-only** toggle
 - **Failed-update detection** — after an upgrade, packages that didn't apply are flagged in red and stay
@@ -143,30 +158,45 @@ downgrades from `shelly downgrade`, cache/orphan cleanup from
 
 ## Sources beyond Shelly
 
-The extra sources are **descriptors, not special cases** — one table entry defines a
-source's command, parser, apply action and staleness window, so adding another is a
-few lines rather than a new code path.
+A source is defined by its command, how to read that command's output, how to apply an
+update, and how long results stay cached — the same four things whether it ships with the
+plugin or you add it yourself. Only **two** are built in; everything else is config.
 
-| Source      | Check command                        | Apply command                | Defined in |
-|-------------|--------------------------------------|------------------------------|------------|
-| DMS plugins | `dms plugins update --all --check`   | `dms plugins update --all`   | built in   |
-| Firmware    | `fwupdmgr get-updates --json`        | `fwupdmgr update` *(manual)* | built in   |
-| mise        | `mise outdated --json`               | `mise upgrade`               | config     |
-| rustup      | `rustup check`                       | `rustup update`              | config     |
+**Built in** — settings toggle, on by default:
 
-Two things make this safe to leave on:
+| Source      | Check command                        | Apply command                |
+|-------------|--------------------------------------|------------------------------|
+| DMS plugins | `dms plugins update --all --check`   | `dms plugins update --all`   |
+| Firmware    | `fwupdmgr get-updates --json`        | `fwupdmgr update` *(manual)* |
+
+**In the config file** — no settings toggle; switched with each entry's `enabled` flag, and
+editable or removable like anything else you add:
+
+| Source          | Check command                                | Apply command                          | Ships as |
+|-----------------|----------------------------------------------|----------------------------------------|----------|
+| mise            | `mise outdated --json`                       | `mise upgrade`                         | enabled  |
+| rustup          | `rustup check`                               | `rustup update`                        | enabled  |
+| npm (global)    | `npm --global outdated --json`               | `npm --global install <pkg>@latest`    | disabled |
+| Flatpak remotes | `flatpak remote-ls --updates`                | *(listing only)*                       | disabled |
+
+The two disabled entries are templates: enable one, or copy it as the starting point for a
+tool of your own.
+
+Two design points apply to every source above, built-in or config:
 
 - **Results are file-backed, not per-widget.** A bar widget exists once per monitor, and
   `dms plugins update --check` is a ~40 s network call — so a refresh runs *once* under a
   lock, writes each source's raw output under `~/.cache/shelly-updater/`, and every
-  instance simply reads those files. Network sources re-run at most every 6 hours;
-  firmware, which is a local daemon query, refreshes every cycle.
+  instance simply reads those files. How long a source's results stay cached is per-source
+  (`minIntervalHours`, default 6); firmware, a local daemon query, refreshes every cycle.
+  Applying an update clears that source's cache immediately, and the refresh button forces
+  a real re-check — so an item never lingers after you have actually updated it.
 - **Failure detection and AI analysis stay Shelly-only.** Those parse pacman/makepkg build
   logs and would mis-read a firmware or plugin run, so external sources are excluded from
   them by design.
 
-Each source disappears entirely when its command isn't installed, so an unused toggle
-costs nothing.
+Each source disappears entirely when its command isn't installed, so leaving one enabled
+costs nothing on a machine that doesn't have the tool.
 
 ### Adding your own sources
 

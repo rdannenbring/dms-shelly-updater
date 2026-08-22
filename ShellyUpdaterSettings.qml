@@ -555,6 +555,12 @@ PluginSettings {
             defaultValue: true
         }
         ToggleSetting {
+            settingKey: "skipDevPlugins"
+            label: "Ignore plugins you're developing"
+            description: "Skip DMS plugins whose folder is a symlink. A symlink means a local development checkout, so it follows your own fork or branch and can never match what the registry compares it against — without this it sits in the list permanently, reported as updatable but impossible to update. Turn off to see them anyway."
+            defaultValue: true
+        }
+        ToggleSetting {
             settingKey: "enableFirmware"
             label: "Device firmware"
             description: "Include firmware updates reported by fwupd/LVFS (needs 'fwupdmgr'). Listing only — firmware is never applied silently or as part of Update All; it always opens a terminal and runs fwupdmgr's own prompts."

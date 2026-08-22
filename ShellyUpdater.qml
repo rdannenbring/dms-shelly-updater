@@ -62,6 +62,12 @@ PluginComponent {
     // brand colours. On means logos AND the plain Material Symbols beside them
     // share one accent, so a menu reads as a single palette; off keeps Arch
     // blue, Flatpak blue, Pac-Man yellow and neutral symbols.
+    // Skip DMS plugins whose directory is a symlink. A symlinked plugin is a
+    // local development checkout (that is how DMS itself tells you to develop
+    // one), so it tracks your own fork or branch and can never match what the
+    // registry compares it against — it would sit in the list permanently,
+    // reported as updatable but impossible to update.
+    readonly property bool skipDevPlugins: _pd.skipDevPlugins !== undefined ? _pd.skipDevPlugins : true
     readonly property bool tintSourceLogos: _pd.tintSourceLogos !== undefined ? _pd.tintSourceLogos : true
     // A logo and the Material Symbol standing in for a source with no logo
     // (firmware) must land on the same colour, or the menu looks half-themed.
@@ -319,6 +325,56 @@ PluginComponent {
         var n = (typeof nameOrItem === "string") ? nameOrItem : ((nameOrItem && nameOrItem.name) || "");
         return root.ignoredPackages.indexOf(n) !== -1;
     }
+    // Held items from non-Shelly sources. `shelly mark ignore` only knows about
+    // pacman/AUR, so these are kept locally, keyed "<source>:<id>" so two
+    // sources can hold the same name without colliding.
+    //
+    // This exists because a source can legitimately report an update that
+    // cannot be applied here — a DMS plugin checked out from a fork or parked
+    // on a feature branch never matches the registry's upstream, so it would
+    // otherwise sit in the list permanently with no way to act on it.
+    property var extHeld: []
+    function _extHoldKey(item) {
+        return (item.source || "") + ":" + (item.id || item.name || "");
+    }
+    function _isExtHeld(item) {
+        return root.extHeld.indexOf(root._extHoldKey(item)) !== -1;
+    }
+    function holdExtItem(item) {
+        if (!item || root._isExtHeld(item))
+            return;
+        root.extHeld = root.extHeld.concat([root._extHoldKey(item)]);
+        root._saveExtHeld();
+    }
+    function unholdExtKey(key) {
+        root.extHeld = root.extHeld.filter(function (k) { return k !== key; });
+        root._saveExtHeld();
+    }
+    function _saveExtHeld() {
+        if (pluginService && pluginService.savePluginState)
+            pluginService.savePluginState(pluginId, "extHeld", JSON.stringify(root.extHeld));
+    }
+    // A held key reads back as "dmsPlugins:ioMonitor"; show it as
+    // "ioMonitor (DMS Plugins)" so the held list is legible.
+    function extHoldLabel(key) {
+        var i = String(key).indexOf(":");
+        if (i === -1)
+            return key;
+        var p = root.extProvider(key.substring(0, i));
+        return key.substring(i + 1) + (p ? " (" + p.label + ")" : "");
+    }
+
+    // One list for the Held view, so Shelly's ignore list and the local
+    // non-Shelly holds are managed in the same place.
+    readonly property var heldEntries: {
+        var out = [];
+        for (var i = 0; i < root.ignoredPackages.length; i++)
+            out.push({ key: root.ignoredPackages[i], label: root.ignoredPackages[i], isExt: false });
+        for (var j = 0; j < root.extHeld.length; j++)
+            out.push({ key: root.extHeld[j], label: root.extHoldLabel(root.extHeld[j]), isExt: true });
+        return out;
+    }
+
     // "Shown" = what the user still needs to act on (held items filtered out).
     readonly property var pacmanUpdatesShown: pacmanUpdates.filter(u => !root._isHeld(u))
     readonly property var aurUpdatesShown: aurUpdatesEffective.filter(u => !root._isHeld(u))
@@ -360,7 +416,7 @@ PluginComponent {
             icon: "extension",
             rank: 0,
             bin: "dms",
-            listCmd: ["dms", "plugins", "update", "--all", "--check"],
+            listCmd: root._dmsPluginsListCmd(),
             // "Update available for plugin: I/O Monitor (ID: ioMonitor)".
             // No versions — DMS plugins are git checkouts, not releases.
             // `exclude` keeps us from offering to update OURSELVES: that
@@ -598,6 +654,22 @@ PluginComponent {
         return true;
     }
 
+    // With skipDevPlugins on, filter the check's own output rather than
+    // post-processing it: each reported id is dropped when its plugin directory
+    // is a symlink. Lines without an "(ID: …)" are passed through untouched so
+    // the trailing summary line survives.
+    function _dmsPluginsListCmd() {
+        var plain = ["dms", "plugins", "update", "--all", "--check"];
+        if (!root.skipDevPlugins)
+            return plain;
+        var dir = root.extSourcesDir + "/plugins";
+        return ["sh", "-c",
+            plain.map(_shq).join(" ") + " | while IFS= read -r l; do "
+            + "case \"$l\" in *\"(ID: \"*) id=${l##*\"(ID: \"}; id=${id%)} ;; "
+            + "*) printf '%s\\n' \"$l\"; continue ;; esac; "
+            + "[ -L " + _shq(dir) + "/\"$id\" ] || printf '%s\\n' \"$l\"; done"];
+    }
+
     function extProvider(id) {
         for (var i = 0; i < root.extProviders.length; i++)
             if (root.extProviders[i].id === id)
@@ -623,7 +695,10 @@ PluginComponent {
         return root._pd[key] !== undefined ? root._pd[key] : p.defaultOn;
     }
     function extItems(id) {
-        return root.extUpdates[id] || [];
+        var all = root.extUpdates[id] || [];
+        if (root.extHeld.length === 0)
+            return all;
+        return all.filter(function (it) { return !root._isExtHeld(it); });
     }
     readonly property var extActiveProviders: extProviders.filter(p => root.extEnabled(p))
     readonly property int extCount: {
@@ -961,6 +1036,8 @@ PluginComponent {
             try {
                 root.newsSeen = JSON.parse(pluginService.loadPluginState(pluginId, "newsSeen", "{}")) || {};
                 root.newsInit = pluginService.loadPluginState(pluginId, "newsInit", "false") === "true";
+                var eh = JSON.parse(pluginService.loadPluginState(pluginId, "extHeld", "[]"));
+                root.extHeld = Array.isArray(eh) ? eh : [];
             } catch (e3) {}
         }
         // Fallback (also when the pluginService store came back empty, as it can
@@ -3390,8 +3467,8 @@ PluginComponent {
             lines.push("AppImage: " + appimageUpdates.length);
         for (var p = 0; p < extActiveProviders.length; p++)
             lines.push(extActiveProviders[p].label + ": " + extItems(extActiveProviders[p].id).length);
-        if (ignoredPackages.length > 0)
-            lines.push("Held: " + ignoredPackages.length);
+        if (heldEntries.length > 0)
+            lines.push("Held: " + heldEntries.length);
         if (tooltipShowPackages && updateCount > 0) {
             var all = allShownItems();
             lines.push("");
@@ -4179,6 +4256,8 @@ PluginComponent {
                             if (mouse.button === Qt.RightButton) {
                                 if (modelData.source === "pacman" || modelData.source === "aur")
                                     root.holdPackage(modelData.name);
+                                else if (root.extProvider(modelData.source))
+                                    root.holdExtItem(modelData);
                             } else {
                                 uv.rowActivated(modelData);
                             }
@@ -4554,7 +4633,7 @@ PluginComponent {
         MenuItem {
             visible: !mv.embedded; height: visible ? 44 : 0
             itemIcon: "block"; itemLabel: "Held Packages…"
-            badge: root.ignoredPackages.length > 0 ? String(root.ignoredPackages.length) : ""
+            badge: root.heldEntries.length > 0 ? String(root.heldEntries.length) : ""
             onTriggered: root.openHeld()
         }
         MenuItem {
@@ -4803,9 +4882,14 @@ PluginComponent {
         Row {
             width: dv.contentWidth
             spacing: Theme.spacingS
-            readonly property bool isHeld: dv.pkg ? root._isHeld(dv.pkg.name) : false
-            // ignore/downgrade apply to pacman/AUR, not flatpak/appimage.
-            readonly property bool canHold: dv.pkg && (dv.pkg.source === "pacman" || dv.pkg.source === "aur")
+            readonly property bool isExt: dv.pkg ? (root.extProvider(dv.pkg.source) !== null) : false
+            readonly property bool isHeld: dv.pkg
+                ? (isExt ? root._isExtHeld(dv.pkg) : root._isHeld(dv.pkg.name))
+                : false
+            // Hold covers pacman/AUR (via shelly) and every non-Shelly source
+            // (locally); downgrade is pacman-only.
+            readonly property bool canHold: dv.pkg && (dv.pkg.source === "pacman" || dv.pkg.source === "aur"
+                || root.extProvider(dv.pkg.source) !== null)
             // v3: AUR downgrade needs a commit-picker (2.1.0) — standard only for now.
             readonly property bool canDowngrade: dv.pkg && dv.pkg.source === "pacman"
 
@@ -4815,7 +4899,12 @@ PluginComponent {
                 icon: parent.isHeld ? "check_circle" : "block"
                 label: parent.isHeld ? "Unhold" : "Hold"
                 onTriggered: {
-                    if (parent.isHeld)
+                    if (parent.isExt) {
+                        if (parent.isHeld)
+                            root.unholdExtKey(root._extHoldKey(dv.pkg));
+                        else
+                            root.holdExtItem(dv.pkg);
+                    } else if (parent.isHeld)
                         root.unholdPackage(dv.pkg.name);
                     else
                         root.holdPackage(dv.pkg.name);
@@ -6372,8 +6461,8 @@ PluginComponent {
                         width: parent.width - Theme.spacingL * 2
                         horizontalAlignment: Text.AlignHCenter
                         wrapMode: Text.WordWrap
-                        visible: root.ignoredPackages.length === 0
-                        text: "No held packages.\nRight-click a package in the updates list, or use Hold in its details, to pin it here."
+                        visible: root.heldEntries.length === 0
+                        text: "No held packages.\nRight-click anything in the updates list, or use Hold in its details, to pin it here."
                         color: Theme.surfaceText
                         font.pixelSize: Theme.fontSizeMedium
                     }
@@ -6381,10 +6470,10 @@ PluginComponent {
                     DankListView {
                         anchors.fill: parent
                         anchors.margins: Theme.spacingS
-                        visible: root.ignoredPackages.length > 0
+                        visible: root.heldEntries.length > 0
                         clip: true
                         spacing: Theme.spacingXS
-                        model: root.ignoredPackages
+                        model: root.heldEntries
 
                         delegate: Rectangle {
                             required property var modelData
@@ -6401,7 +6490,7 @@ PluginComponent {
                                 anchors.right: unholdBtn.left
                                 anchors.rightMargin: Theme.spacingS
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: modelData
+                                text: modelData.label
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: Theme.surfaceText
                                 elide: Text.ElideRight
@@ -6415,7 +6504,8 @@ PluginComponent {
                                 iconName: "delete"
                                 iconSize: 18
                                 iconColor: Theme.error
-                                onClicked: root.unholdPackage(modelData)
+                                onClicked: modelData.isExt ? root.unholdExtKey(modelData.key)
+                                                           : root.unholdPackage(modelData.key)
                             }
                         }
                     }
