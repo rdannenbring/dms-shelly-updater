@@ -1810,13 +1810,21 @@ PluginComponent {
 
     property bool isCheckingExt: false
 
+    // A refresh pressed while a check is already running used to be swallowed
+    // silently: the button appeared dead, and since the external check can take
+    // ~15s the natural reaction is to press it again, then again. Remember the
+    // request and honour it when the current pass ends.
+    property bool _extRecheckQueued: false
+
     function _startExtCheck() {
         if (root.extActiveProviders.length === 0) {
             root.extUpdates = ({});
             return;
         }
-        if (root.isCheckingExt)
+        if (root.isCheckingExt) {
+            root._extRecheckQueued = true;
             return;
+        }
         root.isCheckingExt = true;
         // Read first so stored results appear immediately, then refresh in the
         // background and read once more to pick up anything new.
@@ -1834,6 +1842,13 @@ PluginComponent {
             if (root._extRefreshDone) {
                 root._extRefreshDone = false;
                 root.isCheckingExt = false;
+                if (root._extRecheckQueued) {
+                    root._extRecheckQueued = false;
+                    // Honour the press that arrived mid-pass, and force it:
+                    // whatever prompted it happened after the last check began.
+                    root._invalidateExtStamps(root.extActiveProviders.map(function (p) { return p.id; }));
+                    root._startExtCheck();
+                }
                 return;
             }
             // First read done — now refresh, then read again.
@@ -3883,6 +3898,12 @@ PluginComponent {
                 spacing: Theme.spacingS
                 StyledText {
                     anchors.verticalCenter: parent.verticalCenter
+                    // Keep showing the count while only the external check is
+                    // running — the spinning refresh icon already says work is
+                    // in progress, and blanking a known count to "Checking…"
+                    // for ~15s every cycle loses more than it tells you.
+                    // "Checking…" still wins when the count is 0, so a partial
+                    // pass can't flash a premature "Up to date".
                     text: root._externalBusy ? "Locked" : (root.isChecking ? "Checking…" : ((root.updateCount === 0 && root.isCheckingExt) ? "Checking…" : (root.updateCount === 0 ? "Up to date" : root.updateCount + (root.updateCount === 1 ? " update" : " updates"))))
                     font.pixelSize: Theme.fontSizeMedium
                     color: root._externalBusy ? Theme.warning : (root.hasError ? Theme.error : Theme.surfaceVariantText)
@@ -3900,7 +3921,7 @@ PluginComponent {
                     onClicked: root.refreshAll()
                     RotationAnimation on rotation {
                         from: 0; to: 360; duration: 1000
-                        loops: Animation.Infinite; running: root.isChecking
+                        loops: Animation.Infinite; running: root.isChecking || root.isCheckingExt
                     }
                 }
             }
@@ -5140,10 +5161,10 @@ PluginComponent {
                         anchors.centerIn: parent
                         name: "refresh"
                         size: Theme.iconSize - 6
-                        color: root.isChecking ? Theme.primary : Theme.surfaceText
+                        color: (root.isChecking || root.isCheckingExt) ? Theme.primary : Theme.surfaceText
                         RotationAnimation on rotation {
                             from: 0; to: 360; duration: 1000
-                            loops: Animation.Infinite; running: root.isChecking
+                            loops: Animation.Infinite; running: root.isChecking || root.isCheckingExt
                             onRunningChanged: { if (!running) ccRefreshIcon.rotation = 0; }
                         }
                     }
