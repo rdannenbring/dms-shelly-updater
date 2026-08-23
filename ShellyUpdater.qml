@@ -1253,6 +1253,19 @@ PluginComponent {
             } catch (elrs) {
                 // keep current value
             }
+            // Holding something on one monitor has to hold it on all of them.
+            // Shelly's own ignore list syncs for free because every instance
+            // re-reads it from `shelly mark ignore` on each check; the local
+            // non-Shelly holds have no such external source of truth, so they
+            // ride this broadcast like the failure state above.
+            var ehs = root.pluginService.loadPluginState(root.pluginId, "extHeld", "[]");
+            try {
+                var ehp = JSON.parse(ehs);
+                if (Array.isArray(ehp))
+                    root.extHeld = ehp;
+            } catch (eeh) {
+                // keep current value
+            }
             var fh = root.pluginService.loadPluginState(root.pluginId, "failureHistory", "[]");
             try {
                 root.failureHistory = root._pruneFailureHistory(JSON.parse(fh));
