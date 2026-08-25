@@ -1234,13 +1234,18 @@ PluginComponent {
         function onPluginStateChanged(changedPluginId) {
             if (changedPluginId !== root.pluginId || !root.pluginService.loadPluginState)
                 return;
+            // Order matters: clear the "someone is updating" beat FIRST. The
+            // instance that finishes an update broadcasts the stopped beat and
+            // a new refresh token together, and the guard in refresh() now
+            // rejects a check while remoteUpgrading is true — so reading the
+            // token first would drop the very refresh that update asked for.
+            root._upgradeBeat = root.pluginService.loadPluginState(root.pluginId, "upgradeBeat", 0);
+            root._evalRemoteUpgrading();
             var token = root.pluginService.loadPluginState(root.pluginId, "refreshToken", 0);
             if (token !== root._refreshToken) {
                 root._refreshToken = token;
                 root.refresh(false);
             }
-            root._upgradeBeat = root.pluginService.loadPluginState(root.pluginId, "upgradeBeat", 0);
-            root._evalRemoteUpgrading();
             var fp = root.pluginService.loadPluginState(root.pluginId, "failedPackages", "[]");
             try {
                 root.failedPackages = JSON.parse(fp);
@@ -1291,7 +1296,12 @@ PluginComponent {
     property bool _pendingBg: false
 
     function refresh(isBackground) {
-        if (isChecking || isUpgrading || _probing)
+        // remoteUpgrading matters as much as isUpgrading here: an update
+        // launched from another monitor holds the pacman lock just the same, so
+        // a check started here fails against it and leaves THIS instance — and
+        // only this one — showing the error state. That is what made the busy
+        // icon red on one screen and accent-coloured on the other.
+        if (isChecking || isUpgrading || remoteUpgrading || _probing)
             return;
         _pendingBg = isBackground === true;
         _probing = true;
@@ -1313,7 +1323,7 @@ PluginComponent {
     }
 
     function _doRefresh(isBackground) {
-        if (isChecking || isUpgrading)
+        if (isChecking || isUpgrading || remoteUpgrading)
             return;
         // A refresh the user asked for means "check now, really": drop the
         // staleness stamps so cached sources actually re-run. Without this the
