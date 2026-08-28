@@ -1,5 +1,7 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Effects
+import Qt5Compat.GraphicalEffects
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
@@ -56,6 +58,21 @@ PluginComponent {
     readonly property bool enableAppimage: _pd.enableAppimage !== undefined ? _pd.enableAppimage : false
     readonly property bool excludeDevelAur: _pd.excludeDevelAur !== undefined ? _pd.excludeDevelAur : false
     readonly property bool alwaysConfirmKernel: _pd.alwaysConfirmKernel !== undefined ? _pd.alwaysConfirmKernel : false
+    // Draw the widget's icons in the current theme colour instead of their own
+    // brand colours. On means logos AND the plain Material Symbols beside them
+    // share one accent, so a menu reads as a single palette; off keeps Arch
+    // blue, Flatpak blue, Pac-Man yellow and neutral symbols.
+    // Skip DMS plugins whose directory is a symlink. A symlinked plugin is a
+    // local development checkout (that is how DMS itself tells you to develop
+    // one), so it tracks your own fork or branch and can never match what the
+    // registry compares it against — it would sit in the list permanently,
+    // reported as updatable but impossible to update.
+    readonly property bool skipDevPlugins: _pd.skipDevPlugins !== undefined ? _pd.skipDevPlugins : true
+    readonly property bool tintSourceLogos: _pd.tintSourceLogos !== undefined ? _pd.tintSourceLogos : true
+    // A logo and the Material Symbol standing in for a source with no logo
+    // (firmware) must land on the same colour, or the menu looks half-themed.
+    readonly property color menuIconColor: root.tintSourceLogos ? Theme.primary : Theme.surfaceText
+    readonly property color rowIconColor: root.tintSourceLogos ? Theme.primary : Theme.surfaceVariantText
     readonly property string iconDefault: _pd.iconDefault || "check_circle"
     readonly property string iconUpdates: _pd.iconUpdates || "system_update_alt"
     // Failures get their own GLYPH, not just a color — bar theming can render
@@ -160,6 +177,123 @@ PluginComponent {
         return c;
     }
 
+    // ---- Per-source brand logos -----------------------------------------
+    // Bundled under assets/ rather than fetched, so the widget never depends on
+    // the network to draw itself. `themed: true` marks a mark that is drawn in
+    // plain ink and therefore ships as a pair: the base file is inked dark for
+    // light backgrounds, the "-dark" file inked light for dark ones. Everything
+    // else is a single brand-coloured asset that reads on either.
+    // Firmware deliberately has no entry — its Material Symbol suits it better
+    // than any vendor mark would.
+    // Every mark here is drawn in ONE colour with its detail as negative space,
+    // so all of them tint by colour replacement and land on exactly the accent
+    // (see SourceIcon). AppImage originally did not qualify — it shipped as a
+    // gradient-shaded plate with the arrow and cog painted on top — so it is
+    // redrawn in assets/ with those knocked out instead, which both fixes the
+    // odd-one-out shading and keeps the shapes readable at 22px.
+    readonly property var sourceAssets: ({
+        "pacman":     { base: "pacman", flat: true },
+        "aur":        { base: "arch", flat: true },
+        "flatpak":    { base: "flatpak", flat: true },
+        "appimage":   { base: "appimage", flat: true },
+        "dmsPlugins": { base: "dms", flat: true },
+        "mise":       { base: "mise", themed: true, flat: true },
+        "rustup":     { base: "rust", themed: true, flat: true }
+    })
+    function sourceIconUrl(src) {
+        var a = root.sourceAssets[src];
+        if (!a)
+            return "";
+        var name = a.themed ? (a.base + (Theme.isLightMode ? "" : "-dark")) : a.base;
+        return Qt.resolvedUrl("assets/" + name + ".svg");
+    }
+    // Which of the two tinting routes a mark needs — see SourceIcon.
+    function sourceIsFlatInk(src) {
+        var a = root.sourceAssets[src];
+        return a !== undefined && a.flat === true;
+    }
+
+    // A source's logo, falling back to a Material Symbol when it has no asset
+    // (firmware) or the file fails to load. Declared at top level — nested
+    // inline components are not supported.
+    component SourceIcon: Item {
+        id: si
+        property string sourceId: ""
+        property string fallbackIcon: ""
+        property int iconSize: Theme.iconSize - 2
+        property color fallbackColor: Theme.surfaceText
+        readonly property url assetUrl: root.sourceIconUrl(si.sourceId)
+        implicitWidth: si.iconSize
+        implicitHeight: si.iconSize
+        Image {
+            id: siImage
+            anchors.fill: parent
+            source: si.assetUrl
+            visible: String(si.assetUrl) !== "" && status === Image.Ready
+            // Rasterise at 2x so the SVG stays crisp on scaled outputs.
+            sourceSize.width: si.iconSize * 2
+            sourceSize.height: si.iconSize * 2
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+            asynchronous: true
+            // Theme tinting takes one of TWO routes, because colorization is
+            // the wrong tool for most of these marks.
+            //
+            // MultiEffect colorization shifts hue and saturation but PRESERVES
+            // LIGHTNESS. That has two consequences, both of which showed up on
+            // screen before this split existed:
+            //   * pure ink cannot move at all — mise and Rust ship as #fff on
+            //     dark / #000 on light, and white stays white however hard you
+            //     colorize it, so those two sat there untinted;
+            //   * everything else comes out as dim or bright as its own brand
+            //     colour happens to be. Arch (#1793D1) and Flatpak (#4a90d9)
+            //     have under half the relative luminance of Pac-Man's yellow
+            //     (0.26 vs 0.63), so they rendered visibly darker than their
+            //     neighbours in the same menu.
+            //
+            // So any mark drawn in ONE colour is tinted with ColorOverlay,
+            // which replaces colour outright and keeps only alpha: every such
+            // mark lands on exactly the accent, and nothing is lost because
+            // there is no internal shading to lose — Flatpak's cube facets and
+            // Dank's face are negative space, and come through intact.
+            //
+            // Every bundled mark currently qualifies, so the colorization
+            // branch below is a FALLBACK rather than a live path: it is what a
+            // future multi-tone asset would get if it were added without
+            // `flat: true`. It carries a lift in light mode, where the mapping
+            // otherwise leaves artwork sitting just below the surface colour as
+            // a dark smudge. (No saturation pass — MultiEffect desaturates
+            // AFTER colorizing, so asking for one washes the tint back out.)
+            // AppImage used to be the one asset on this path; it is now redrawn
+            // with its arrow and cog as knockouts so it can take the accent
+            // exactly like the rest.
+            layer.enabled: root.tintSourceLogos
+            layer.effect: root.sourceIsFlatInk(si.sourceId) ? flatInkTint : shadedTint
+        }
+        Component {
+            id: shadedTint
+            MultiEffect {
+                brightness: Theme.isLightMode ? 0.32 : 0
+                contrast: Theme.isLightMode ? 0.16 : 0
+                colorization: 1.0
+                colorizationColor: Theme.primary
+            }
+        }
+        Component {
+            id: flatInkTint
+            ColorOverlay {
+                color: Theme.primary
+            }
+        }
+        DankIcon {
+            anchors.centerIn: parent
+            visible: !siImage.visible
+            name: si.fallbackIcon
+            size: si.iconSize
+            color: si.fallbackColor
+        }
+    }
+
     // VCS/devel AUR packages (`-git`, etc.) report "latest-commit" as their new
     // version — upstream commits, not real releases. Optionally exclude them.
     function _isDevelAur(u) {
@@ -167,7 +301,8 @@ PluginComponent {
     }
 
     // Category label + rank for the "type" sort (pacman → aur → devel → flatpak
-    // → appimage). Devel is an AUR sub-category, matching the row chips.
+    // → appimage → external providers in descriptor order). Devel is an AUR
+    // sub-category, matching the row chips.
     function _typeLabel(u) {
         if (u.source === "aur" && root._isDevelAur(u))
             return "devel";
@@ -178,7 +313,8 @@ PluginComponent {
         if (u.source === "aur") return root._isDevelAur(u) ? 2 : 1;
         if (u.source === "flatpak") return 3;
         if (u.source === "appimage") return 4;
-        return 5;
+        var p = root.extProvider(u.source);
+        return p ? 5 + p.rank : 99;
     }
     readonly property var aurUpdatesEffective: excludeDevelAur ? aurUpdates.filter(u => !root._isDevelAur(u)) : aurUpdates
 
@@ -189,6 +325,56 @@ PluginComponent {
         var n = (typeof nameOrItem === "string") ? nameOrItem : ((nameOrItem && nameOrItem.name) || "");
         return root.ignoredPackages.indexOf(n) !== -1;
     }
+    // Held items from non-Shelly sources. `shelly mark ignore` only knows about
+    // pacman/AUR, so these are kept locally, keyed "<source>:<id>" so two
+    // sources can hold the same name without colliding.
+    //
+    // This exists because a source can legitimately report an update that
+    // cannot be applied here — a DMS plugin checked out from a fork or parked
+    // on a feature branch never matches the registry's upstream, so it would
+    // otherwise sit in the list permanently with no way to act on it.
+    property var extHeld: []
+    function _extHoldKey(item) {
+        return (item.source || "") + ":" + (item.id || item.name || "");
+    }
+    function _isExtHeld(item) {
+        return root.extHeld.indexOf(root._extHoldKey(item)) !== -1;
+    }
+    function holdExtItem(item) {
+        if (!item || root._isExtHeld(item))
+            return;
+        root.extHeld = root.extHeld.concat([root._extHoldKey(item)]);
+        root._saveExtHeld();
+    }
+    function unholdExtKey(key) {
+        root.extHeld = root.extHeld.filter(function (k) { return k !== key; });
+        root._saveExtHeld();
+    }
+    function _saveExtHeld() {
+        if (pluginService && pluginService.savePluginState)
+            pluginService.savePluginState(pluginId, "extHeld", JSON.stringify(root.extHeld));
+    }
+    // A held key reads back as "dmsPlugins:ioMonitor"; show it as
+    // "ioMonitor (DMS Plugins)" so the held list is legible.
+    function extHoldLabel(key) {
+        var i = String(key).indexOf(":");
+        if (i === -1)
+            return key;
+        var p = root.extProvider(key.substring(0, i));
+        return key.substring(i + 1) + (p ? " (" + p.label + ")" : "");
+    }
+
+    // One list for the Held view, so Shelly's ignore list and the local
+    // non-Shelly holds are managed in the same place.
+    readonly property var heldEntries: {
+        var out = [];
+        for (var i = 0; i < root.ignoredPackages.length; i++)
+            out.push({ key: root.ignoredPackages[i], label: root.ignoredPackages[i], isExt: false });
+        for (var j = 0; j < root.extHeld.length; j++)
+            out.push({ key: root.extHeld[j], label: root.extHoldLabel(root.extHeld[j]), isExt: true });
+        return out;
+    }
+
     // "Shown" = what the user still needs to act on (held items filtered out).
     readonly property var pacmanUpdatesShown: pacmanUpdates.filter(u => !root._isHeld(u))
     readonly property var aurUpdatesShown: aurUpdatesEffective.filter(u => !root._isHeld(u))
@@ -201,18 +387,343 @@ PluginComponent {
     }
     readonly property bool hasKernelUpdate: pacmanUpdatesShown.some(u => root._isKernel(u))
 
+    // =====================================================================
+    // External update providers (everything that is NOT Shelly)
+    // =====================================================================
+    // Each source is a DESCRIPTOR, not a code path, so adding one is an entry
+    // in this list plus a settings toggle — no new plumbing. Fields:
+    //   id        stable key; doubles as the item `source`, the chip text and
+    //             the settings flag (`enable` + Id, e.g. enableFirmware)
+    //   label     human name used in menus and the tooltip
+    //   icon      Material Symbol for the menu row
+    //   rank      sort order among external sources (Shelly owns ranks 0-4)
+    //   bin       binary that must exist, else the provider is hidden entirely
+    //   listCmd   argv producing machine-readable stdout
+    //   parse     function(text) -> array of normalized items
+    //   applyAll  argv updating everything from this source (null = read-only)
+    //   applyOne  function(item) -> argv (null = no per-item update)
+    //   readOnly  true = never offer an in-widget apply, only a hand-off
+    //   note      one-line caveat surfaced in the menu subtitle
+    //   defaultOn shipped default for the toggle
+    //
+    // External sources are DELIBERATELY excluded from failure tracking and AI
+    // analysis — both parse Shelly/pacman build logs and would mis-classify a
+    // firmware or plugin run.
+    readonly property var extBuiltinProviders: [
+        {
+            id: "dmsPlugins",
+            label: "DMS Plugins",
+            icon: "extension",
+            rank: 0,
+            bin: "dms",
+            listCmd: root._dmsPluginsListCmd(),
+            // "Update available for plugin: I/O Monitor (ID: ioMonitor)".
+            // No versions — DMS plugins are git checkouts, not releases.
+            // `exclude` keeps us from offering to update OURSELVES: that
+            // rewrites the plugin directory, and DMS reloads the plugin the
+            // moment it changes, tearing down this component mid-run.
+            parseSpec: {
+                type: "regex",
+                pattern: "^Update available for plugin:\\s*(.+?)\\s*\\(ID:\\s*([^)]+)\\)\\s*$",
+                name: 1,
+                id: 2,
+                versionText: "update available",
+                exclude: ["shellyUpdater"]
+            },
+            applyAll: ["dms", "plugins", "update", "--all"],
+            applyOne: ["dms", "plugins", "update", "{id}"],
+            readOnly: false,
+            note: "",
+            // Queries the plugin registry over the network and takes ~40s.
+            // Cached hard so an hourly check doesn't hammer GitHub four times
+            // over (once per bar instance).
+            minIntervalMs: 6 * 3600 * 1000,
+            defaultOn: true
+        },
+        {
+            id: "firmware",
+            label: "Firmware",
+            icon: "memory",
+            rank: 1,
+            bin: "fwupdmgr",
+            listCmd: ["fwupdmgr", "get-updates", "--json"],
+            parse: function (text) { return root._parseFwupd(text); },
+            // Firmware is the one update here that can brick hardware, so it is
+            // hand-off only: the terminal opens and fwupdmgr runs its own
+            // confirmation prompts. Never silently applied.
+            applyAll: ["fwupdmgr", "update"],
+            applyOne: ["fwupdmgr", "update", "{id}"],
+            readOnly: true,
+            note: "Runs interactively — some devices need a reboot",
+            // Purely local (reads fwupd's daemon state), so it runs every cycle.
+            minIntervalMs: 0,
+            defaultOn: true
+        }
+    ]
+
+    // ---- User-defined sources -------------------------------------------
+    // Sources the user adds in a JSON file, parsed through the same spec engine
+    // the built-ins now use. They carry their own `enabled` flag rather than a
+    // DMS toggle: toggles have to be declared statically in the settings QML,
+    // and the file is already the place this kind of source is configured.
+    readonly property string extSourcesPath: (Quickshell.env("XDG_CONFIG_HOME")
+        || (Quickshell.env("HOME") + "/.config"))
+        + "/DankMaterialShell/shelly-updater-sources.json"
+    property var extUserProviders: []
+    // Human-readable rejections, surfaced in the updates view. A bad entry is
+    // dropped on its own — one typo must not take the other sources with it.
+    property var extConfigErrors: []
+    property bool extSourcesLoaded: false
+
+    readonly property var extProviders: extBuiltinProviders.concat(extUserProviders)
+
+    readonly property string extSourcesDir: (Quickshell.env("XDG_CONFIG_HOME")
+        || (Quickshell.env("HOME") + "/.config")) + "/DankMaterialShell"
+    readonly property string extSourcesExample:
+        String(Qt.resolvedUrl("examples/shelly-updater-sources.json")).replace(/^file:\/\//, "")
+    property string _extSourcesText: ""
+    property bool _extSeedTried: false
+
+    Process {
+        id: extSourcesProc
+        command: ["cat", root.extSourcesPath]
+        stdout: StdioCollector {
+            onStreamFinished: root._extSourcesText = text || ""
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+        onExited: {
+            // First run has no file (cat exits non-zero, stdout empty). Seed it
+            // from the shipped example so mise and Rust keep working out of the
+            // box now that they live in config rather than in the widget — then
+            // re-read. `cp -n` means an existing file is never touched, so a
+            // user who empties or edits theirs keeps it.
+            if (String(root._extSourcesText).trim() === "" && !root._extSeedTried) {
+                root._extSeedTried = true;
+                extSeedProc.running = true;
+                return;
+            }
+            root._loadUserSources(root._extSourcesText);
+            root.extSourcesLoaded = true;
+            // Detection has to wait for this, or user-defined binaries are
+            // never probed and their sources stay invisible.
+            extDetectProc.running = true;
+        }
+    }
+
+    Process {
+        id: extSeedProc
+        command: ["sh", "-c",
+            "mkdir -p " + _shq(root.extSourcesDir)
+            + " && cp -n " + _shq(root.extSourcesExample) + " " + _shq(root.extSourcesPath)]
+        stdout: StdioCollector { onStreamFinished: {} }
+        stderr: StdioCollector { onStreamFinished: {} }
+        // Whether the copy worked or not, re-read: the second pass proceeds
+        // regardless because _extSeedTried is now set.
+        onExited: extSourcesProc.running = true
+    }
+
+    function _loadUserSources(text) {
+        var t = String(text || "").trim();
+        root.extUserProviders = [];
+        root.extConfigErrors = [];
+        if (t.length === 0)
+            return;
+        var data;
+        try {
+            data = JSON.parse(t);
+        } catch (e) {
+            root.extConfigErrors = ["sources file is not valid JSON — " + String(e)];
+            return;
+        }
+        var list = Array.isArray(data)
+            ? data
+            : ((data && Array.isArray(data.sources)) ? data.sources : null);
+        if (!list) {
+            root.extConfigErrors = ["sources file must be a JSON array of sources, "
+                + "or an object with a \"sources\" array"];
+            return;
+        }
+        // Ids that would collide with something the widget already owns.
+        var taken = ["pacman", "aur", "flatpak", "appimage"];
+        for (var b = 0; b < root.extBuiltinProviders.length; b++)
+            taken.push(root.extBuiltinProviders[b].id);
+
+        var out = [], errs = [];
+        for (var i = 0; i < list.length; i++) {
+            var res = root._validateUserSource(list[i], i, taken);
+            if (res.error) {
+                errs.push(res.error);
+                continue;
+            }
+            // Rank after the built-ins, in file order.
+            res.provider.rank = 100 + i;
+            out.push(res.provider);
+            taken.push(res.provider.id);
+        }
+        root.extUserProviders = out;
+        root.extConfigErrors = errs;
+    }
+
+    // Returns { provider } or { error }. Every rejection names the entry and
+    // says what is wrong with it, because the alternative — a source silently
+    // not appearing — is the worst way to debug a config file.
+    function _validateUserSource(o, idx, taken) {
+        function fail(msg, id) {
+            return { error: "source #" + (idx + 1) + (id ? " (\"" + id + "\")" : "") + ": " + msg };
+        }
+        if (!o || typeof o !== "object" || Array.isArray(o))
+            return fail("must be a JSON object");
+        var id = o.id;
+        if (typeof id !== "string" || !/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(id))
+            return fail("\"id\" must be a short name starting with a letter (letters, digits, - and _)");
+        if (taken.indexOf(id) !== -1)
+            return fail("id is already used by another source", id);
+        if (typeof o.bin !== "string" || o.bin.trim() === "")
+            return fail("\"bin\" must name the command to look for", id);
+        if (!root._isStringArray(o.listCmd) || o.listCmd.length === 0)
+            return fail("\"listCmd\" must be a non-empty array of strings", id);
+        if (o.applyAll !== undefined && !root._isStringArray(o.applyAll))
+            return fail("\"applyAll\" must be an array of strings", id);
+        if (o.applyOne !== undefined && !root._isStringArray(o.applyOne))
+            return fail("\"applyOne\" must be an array of strings", id);
+
+        var spec = o.parse;
+        if (!spec || typeof spec !== "object")
+            return fail("\"parse\" must be an object with a \"type\"", id);
+        if (spec.type === "regex") {
+            if (typeof spec.pattern !== "string" || spec.pattern === "")
+                return fail("regex parse needs a \"pattern\"", id);
+            try {
+                new RegExp(spec.pattern, spec.flags || "");
+            } catch (e) {
+                return fail("regex \"pattern\" does not compile — " + String(e), id);
+            }
+            if (spec.strip !== undefined) {
+                try {
+                    new RegExp(spec.strip);
+                } catch (e2) {
+                    return fail("regex \"strip\" does not compile — " + String(e2), id);
+                }
+            }
+            if (typeof spec.name !== "number")
+                return fail("regex parse needs \"name\" as a capture-group number", id);
+        } else if (spec.type === "json") {
+            if (typeof spec.name !== "string" || spec.name === "")
+                return fail("json parse needs \"name\" as a field path (or \"$key\")", id);
+        } else {
+            return fail("\"parse.type\" must be \"regex\" or \"json\"", id);
+        }
+
+        if (o.env !== undefined) {
+            if (typeof o.env !== "object" || Array.isArray(o.env) || o.env === null)
+                return fail("\"env\" must be an object of NAME: value strings", id);
+            for (var ek in o.env)
+                if (typeof o.env[ek] !== "string")
+                    return fail("\"env." + ek + "\" must be a string", id);
+        }
+        var hours = (typeof o.minIntervalHours === "number" && o.minIntervalHours >= 0)
+            ? o.minIntervalHours : 6;
+        return {
+            provider: {
+                id: id,
+                label: (typeof o.label === "string" && o.label !== "") ? o.label : id,
+                icon: (typeof o.icon === "string" && o.icon !== "") ? o.icon : "extension",
+                rank: 100 + idx,
+                bin: o.bin.trim(),
+                listCmd: o.listCmd,
+                env: o.env || null,
+                parseSpec: spec,
+                applyAll: o.applyAll || null,
+                applyOne: o.applyOne || null,
+                readOnly: o.readOnly === true,
+                note: (typeof o.note === "string") ? o.note : "",
+                minIntervalMs: Math.round(hours * 3600 * 1000),
+                defaultOn: true,
+                userDefined: true,
+                enabled: o.enabled !== false
+            }
+        };
+    }
+
+    function _isStringArray(v) {
+        if (!Array.isArray(v))
+            return false;
+        for (var i = 0; i < v.length; i++)
+            if (typeof v[i] !== "string")
+                return false;
+        return true;
+    }
+
+    // With skipDevPlugins on, filter the check's own output rather than
+    // post-processing it: each reported id is dropped when its plugin directory
+    // is a symlink. Lines without an "(ID: …)" are passed through untouched so
+    // the trailing summary line survives.
+    function _dmsPluginsListCmd() {
+        var plain = ["dms", "plugins", "update", "--all", "--check"];
+        if (!root.skipDevPlugins)
+            return plain;
+        var dir = root.extSourcesDir + "/plugins";
+        return ["sh", "-c",
+            plain.map(_shq).join(" ") + " | while IFS= read -r l; do "
+            + "case \"$l\" in *\"(ID: \"*) id=${l##*\"(ID: \"}; id=${id%)} ;; "
+            + "*) printf '%s\\n' \"$l\"; continue ;; esac; "
+            + "[ -L " + _shq(dir) + "/\"$id\" ] || printf '%s\\n' \"$l\"; done"];
+    }
+
+    function extProvider(id) {
+        for (var i = 0; i < root.extProviders.length; i++)
+            if (root.extProviders[i].id === id)
+                return root.extProviders[i];
+        return null;
+    }
+
+    // Which provider binaries actually exist on this machine (probed once).
+    // A provider whose binary is missing is hidden rather than shown broken.
+    property var extAvailable: ({})
+    // id -> normalized items from the last check.
+    property var extUpdates: ({})
+
+    // A provider counts only when its binary exists AND its toggle is on.
+    function extEnabled(p) {
+        if (!p || !root.extAvailable[p.id])
+            return false;
+        // User-defined sources are switched in the file that defines them; only
+        // the built-ins have a settings toggle to consult.
+        if (p.userDefined)
+            return p.enabled !== false;
+        var key = "enable" + p.id.charAt(0).toUpperCase() + p.id.slice(1);
+        return root._pd[key] !== undefined ? root._pd[key] : p.defaultOn;
+    }
+    function extItems(id) {
+        var all = root.extUpdates[id] || [];
+        if (root.extHeld.length === 0)
+            return all;
+        return all.filter(function (it) { return !root._isExtHeld(it); });
+    }
+    readonly property var extActiveProviders: extProviders.filter(p => root.extEnabled(p))
+    readonly property int extCount: {
+        var n = 0;
+        for (var i = 0; i < root.extActiveProviders.length; i++)
+            n += root.extItems(root.extActiveProviders[i].id).length;
+        return n;
+    }
+
     readonly property int updateCount: pacmanUpdatesShown.length
         + (enableAur ? aurUpdatesShown.length : 0)
         + (enableFlatpak ? flatpakUpdates.length : 0)
         + (enableAppimage ? appimageUpdates.length : 0)
+        + extCount
 
     // Every actionable update, in display order (used by the list, tooltip, and
     // update-notification signature).
     function allShownItems() {
-        return root.pacmanUpdatesShown
+        var out = root.pacmanUpdatesShown
             .concat(root.enableAur ? root.aurUpdatesShown : [])
             .concat(root.enableFlatpak ? root.flatpakUpdates : [])
             .concat(root.enableAppimage ? root.appimageUpdates : []);
+        for (var i = 0; i < root.extActiveProviders.length; i++)
+            out = out.concat(root.extItems(root.extActiveProviders[i].id));
+        return out;
     }
 
     // Case-insensitive substring match used by the updates & history text
@@ -525,6 +1036,8 @@ PluginComponent {
             try {
                 root.newsSeen = JSON.parse(pluginService.loadPluginState(pluginId, "newsSeen", "{}")) || {};
                 root.newsInit = pluginService.loadPluginState(pluginId, "newsInit", "false") === "true";
+                var eh = JSON.parse(pluginService.loadPluginState(pluginId, "extHeld", "[]"));
+                root.extHeld = Array.isArray(eh) ? eh : [];
             } catch (e3) {}
         }
         // Fallback (also when the pluginService store came back empty, as it can
@@ -721,13 +1234,18 @@ PluginComponent {
         function onPluginStateChanged(changedPluginId) {
             if (changedPluginId !== root.pluginId || !root.pluginService.loadPluginState)
                 return;
+            // Order matters: clear the "someone is updating" beat FIRST. The
+            // instance that finishes an update broadcasts the stopped beat and
+            // a new refresh token together, and the guard in refresh() now
+            // rejects a check while remoteUpgrading is true — so reading the
+            // token first would drop the very refresh that update asked for.
+            root._upgradeBeat = root.pluginService.loadPluginState(root.pluginId, "upgradeBeat", 0);
+            root._evalRemoteUpgrading();
             var token = root.pluginService.loadPluginState(root.pluginId, "refreshToken", 0);
             if (token !== root._refreshToken) {
                 root._refreshToken = token;
                 root.refresh(false);
             }
-            root._upgradeBeat = root.pluginService.loadPluginState(root.pluginId, "upgradeBeat", 0);
-            root._evalRemoteUpgrading();
             var fp = root.pluginService.loadPluginState(root.pluginId, "failedPackages", "[]");
             try {
                 root.failedPackages = JSON.parse(fp);
@@ -738,6 +1256,19 @@ PluginComponent {
             try {
                 root.lastRunSummary = JSON.parse(lrs);
             } catch (elrs) {
+                // keep current value
+            }
+            // Holding something on one monitor has to hold it on all of them.
+            // Shelly's own ignore list syncs for free because every instance
+            // re-reads it from `shelly mark ignore` on each check; the local
+            // non-Shelly holds have no such external source of truth, so they
+            // ride this broadcast like the failure state above.
+            var ehs = root.pluginService.loadPluginState(root.pluginId, "extHeld", "[]");
+            try {
+                var ehp = JSON.parse(ehs);
+                if (Array.isArray(ehp))
+                    root.extHeld = ehp;
+            } catch (eeh) {
                 // keep current value
             }
             var fh = root.pluginService.loadPluginState(root.pluginId, "failureHistory", "[]");
@@ -765,7 +1296,12 @@ PluginComponent {
     property bool _pendingBg: false
 
     function refresh(isBackground) {
-        if (isChecking || isUpgrading || _probing)
+        // remoteUpgrading matters as much as isUpgrading here: an update
+        // launched from another monitor holds the pacman lock just the same, so
+        // a check started here fails against it and leaves THIS instance — and
+        // only this one — showing the error state. That is what made the busy
+        // icon red on one screen and accent-coloured on the other.
+        if (isChecking || isUpgrading || remoteUpgrading || _probing)
             return;
         _pendingBg = isBackground === true;
         _probing = true;
@@ -787,8 +1323,21 @@ PluginComponent {
     }
 
     function _doRefresh(isBackground) {
-        if (isChecking || isUpgrading)
+        if (isChecking || isUpgrading || remoteUpgrading)
             return;
+        // A refresh the user asked for means "check now, really": drop the
+        // staleness stamps so cached sources actually re-run. Without this the
+        // refresh button silently does nothing for them, which is the same
+        // complaint as an item lingering after it was updated elsewhere.
+        if (isBackground !== true)
+            root._invalidateExtStamps(root.extActiveProviders.map(function (p) { return p.id; }));
+        // External providers are independent of Shelly, so they are kicked off
+        // BEFORE the version gate below — an outdated shelly shouldn't blind the
+        // widget to plugin or firmware updates too.
+        if (root.extProbed)
+            root._startExtCheck();
+        else
+            root._extPendingStart = true;
         // Old shelly → every call breaks. Surface once, skip the broken checks.
         if (shellyUnsupported) {
             hasError = true;
@@ -908,6 +1457,462 @@ PluginComponent {
         return out;
     }
 
+    // ---- External provider parsers -------------------------------------
+    // Shared shape for a non-Shelly item. versionText overrides the row's
+    // "old → new" line for sources that have no version pair to show.
+    function _extItem(o) {
+        return {
+            name: o.name || "",
+            id: o.id || o.name || "",
+            oldVersion: o.oldVersion || "",
+            newVersion: o.newVersion || "",
+            versionText: o.versionText || "",
+            description: o.description || "",
+            repository: o.repository || "",
+            source: o.source,
+            downloadSize: 0,
+            installedSize: 0,
+            sizeDifference: 0,
+            raw: o.raw || {}
+        };
+    }
+
+    // `fwupdmgr get-updates --json` → {"Devices":[{Name,Version,Releases:[…]}]}.
+    // With no updates fwupdmgr prints a non-JSON notice and exits non-zero;
+    // both are handled by the caller as "nothing pending", not an error.
+    function _parseFwupd(text) {
+        var trimmed = String(text || "").trim();
+        if (trimmed.length === 0 || trimmed.charAt(0) !== "{")
+            return [];
+        var data = JSON.parse(trimmed);
+        var devs = data.Devices || [];
+        var out = [];
+        for (var i = 0; i < devs.length; i++) {
+            var d = devs[i];
+            var rel = (d.Releases && d.Releases.length > 0) ? d.Releases[0] : null;
+            if (!rel)
+                continue;
+            var flags = d.Flags || [];
+            var needsReboot = flags.indexOf("needs-reboot") !== -1;
+            var desc = rel.Summary || d.Summary || "";
+            if (needsReboot)
+                desc = desc ? (desc + " · reboot required") : "reboot required";
+            out.push(root._extItem({
+                name: d.Name || "Unknown device",
+                // DeviceId is what `fwupdmgr update <id>` expects.
+                id: d.DeviceId || d.Name || "",
+                oldVersion: d.Version || "",
+                newVersion: rel.Version || "",
+                description: desc,
+                repository: rel.RemoteId || "",
+                source: "firmware",
+                raw: d
+            }));
+        }
+        return out;
+    }
+
+    // ---- Declarative parse specs ----------------------------------------
+    // Sources describe how to read their output instead of shipping code for
+    // it, which is what lets a source be defined in a config file (see
+    // extUserProviders). Two shapes cover every source here and most plausible
+    // ones, because update tools essentially all print either one line per
+    // outdated thing or a JSON collection of them.
+    //
+    //   { type: "regex", pattern, flags?, name, id?, current?, latest?,
+    //     strip?, versionText?, description?, exclude?[] }
+    //     Scans stdout line by line; name/id/current/latest are capture-group
+    //     NUMBERS. `strip` is a second pattern removed from both versions (for
+    //     tools that append build metadata). `exclude` drops matched ids.
+    //
+    //   { type: "json", root?, iterate: "array"|"object", name, id?, current?,
+    //     latest?, description?, require?, versionText? }
+    //     Field values are dotted paths resolved against each record, so
+    //     "Releases.0.Version" reaches into nested arrays. The literal "$key"
+    //     yields the object key when iterating an object. `root` is a dotted
+    //     path to the collection; `require` skips records missing that path.
+
+    // Resolve a dotted path, walking objects and numeric array indices alike.
+    function _specGet(obj, path) {
+        if (path === undefined || path === null || path === "")
+            return undefined;
+        var parts = String(path).split(".");
+        var cur = obj;
+        for (var i = 0; i < parts.length; i++) {
+            if (cur === null || cur === undefined)
+                return undefined;
+            var k = parts[i];
+            cur = (Array.isArray(cur) && /^[0-9]+$/.test(k)) ? cur[parseInt(k)] : cur[k];
+        }
+        return cur;
+    }
+
+    function _specStr(v) {
+        return (v === undefined || v === null) ? "" : String(v);
+    }
+
+    function _parseBySpec(spec, text, src) {
+        if (!spec || !spec.type)
+            return [];
+        if (spec.type === "regex")
+            return root._parseRegexSpec(spec, text, src);
+        if (spec.type === "json")
+            return root._parseJsonSpec(spec, text, src);
+        throw new Error("unknown parse type '" + spec.type + "'");
+    }
+
+    function _parseRegexSpec(spec, text, src) {
+        var out = [];
+        var re = new RegExp(spec.pattern, spec.flags || "");
+        var strip = spec.strip ? new RegExp(spec.strip) : null;
+        var exclude = spec.exclude || [];
+        var lines = String(text || "").split("\n");
+        for (var i = 0; i < lines.length; i++) {
+            var m = re.exec(lines[i].trim());
+            if (!m)
+                continue;
+            var g = function (idx) {
+                return (idx === undefined || idx === null) ? "" : String(m[idx] || "").trim();
+            };
+            var name = g(spec.name);
+            var id = (spec.id !== undefined) ? g(spec.id) : name;
+            if (exclude.indexOf(id) !== -1)
+                continue;
+            var cur = g(spec.current), lat = g(spec.latest);
+            if (strip) {
+                cur = cur.replace(strip, "");
+                lat = lat.replace(strip, "");
+            }
+            out.push(root._extItem({
+                name: name, id: id, oldVersion: cur, newVersion: lat,
+                versionText: spec.versionText || "",
+                description: spec.description || "",
+                source: src, raw: { line: lines[i] }
+            }));
+        }
+        return out;
+    }
+
+    function _parseJsonSpec(spec, text, src) {
+        var t = String(text || "").trim();
+        // Tools print a plain-text notice when there is nothing to report, so a
+        // non-JSON body means "none", not a parse failure.
+        if (t.length === 0 || "{[".indexOf(t.charAt(0)) === -1)
+            return [];
+        var data = JSON.parse(t);
+        var coll = spec.root ? root._specGet(data, spec.root) : data;
+        if (coll === undefined || coll === null)
+            return [];
+        var recs = [];
+        if (Array.isArray(coll)) {
+            for (var i = 0; i < coll.length; i++)
+                recs.push({ key: String(i), val: coll[i] });
+        } else {
+            for (var k in coll)
+                recs.push({ key: k, val: coll[k] });
+        }
+        var out = [];
+        for (var j = 0; j < recs.length; j++) {
+            var rec = recs[j];
+            if (spec.require && root._specStr(root._specGet(rec.val, spec.require)) === "")
+                continue;
+            var f = function (path) {
+                if (path === "$key")
+                    return rec.key;
+                return root._specStr(root._specGet(rec.val, path));
+            };
+            var name = f(spec.name);
+            var cur = f(spec.current), lat = f(spec.latest);
+            // A record that reports no newer version is not an update.
+            if (spec.latest && lat !== "" && lat === cur)
+                continue;
+            out.push(root._extItem({
+                name: name,
+                id: (spec.id !== undefined) ? f(spec.id) : name,
+                oldVersion: cur, newVersion: lat,
+                versionText: spec.versionText || "",
+                description: f(spec.description),
+                source: src, raw: rec.val
+            }));
+        }
+        return out;
+    }
+
+    // A provider parses either through its spec or, for the one built-in whose
+    // shape the spec cannot express, its own function.
+    function _providerParse(p, text) {
+        if (typeof p.parse === "function")
+            return p.parse(text) || [];
+        if (p.parseSpec)
+            return root._parseBySpec(p.parseSpec, text, p.id) || [];
+        return [];
+    }
+
+    // Build a per-item apply command. Config-defined sources give an argv
+    // template with {id}/{name}/{current}/{latest} placeholders; built-ins may
+    // still supply a function.
+    function _applyOneArgv(p, item) {
+        if (!p || !p.applyOne)
+            return null;
+        if (typeof p.applyOne === "function")
+            return p.applyOne(item);
+        return p.applyOne.map(function (a) {
+            return String(a)
+                .replace(/\{id\}/g, item.id || "")
+                .replace(/\{name\}/g, item.name || "")
+                .replace(/\{current\}/g, item.oldVersion || "")
+                .replace(/\{latest\}/g, item.newVersion || "");
+        });
+    }
+
+    // ---- External provider probing & checking ---------------------------
+    // One-shot detection of which provider binaries exist. Runs before the
+    // first check; a provider whose binary is absent never appears in the UI.
+    property bool extProbed: false
+    Process {
+        id: extDetectProc
+        command: ["sh", "-c", root._extDetectScript()]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                var found = {};
+                var lines = String(text || "").split("\n");
+                for (var i = 0; i < lines.length; i++) {
+                    var id = lines[i].trim();
+                    if (id.length > 0)
+                        found[id] = true;
+                }
+                root.extAvailable = found;
+                root.extProbed = true;
+                if (root._extPendingStart) {
+                    root._extPendingStart = false;
+                    root._startExtCheck();
+                }
+            }
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+        onExited: root.extProbed = true
+    }
+    // A refresh that lands before detection finishes is deferred, not dropped.
+    property bool _extPendingStart: false
+    function _extDetectScript() {
+        // Also creates the cache/lock directory, so the first check doesn't
+        // trip over flock having nowhere to put its lock file.
+        var parts = ["mkdir -p " + _shq(root.extCacheDir)];
+        for (var i = 0; i < root.extProviders.length; i++) {
+            var p = root.extProviders[i];
+            parts.push("command -v " + p.bin + " >/dev/null 2>&1 && echo " + p.id);
+        }
+        return parts.join("; ");
+    }
+
+    // ---- Shared, file-backed results ------------------------------------
+    // A bar widget is instantiated ONCE PER MONITOR, so a naive design fires
+    // every network-bound provider four times per check. Worse, DMS also spins
+    // up a short-lived plugin instance while loading, and any process that
+    // instance started is killed with it — so a design where the widget that
+    // ran the command is also the one that must receive its output loses the
+    // result outright.
+    //
+    // Both problems go away by splitting refresh from read:
+    //   * REFRESH is one fire-and-forget shell script. It takes a single lock,
+    //     skips providers whose stamp file is still inside their staleness
+    //     window, and writes each provider's raw output to its own file. If it
+    //     is killed partway, nothing is corrupted and no stamp is written, so
+    //     the next cycle simply redoes that provider.
+    //   * READ is a plain concatenation of those files. It is fast, always
+    //     produces output, and never depends on who did the refreshing.
+    // The displayed counts therefore come from whatever the last completed
+    // refresh wrote — by any instance, including a previous login.
+    readonly property string extCacheDir: (Quickshell.env("XDG_CACHE_HOME")
+        || (Quickshell.env("HOME") + "/.cache")) + "/shelly-updater"
+
+    // Delimiter between providers in the read script's output. Deliberately
+    // unlikely to occur in a package name or firmware summary.
+    readonly property string extMarker: "@@SU-PROVIDER:"
+
+    function _extPaths(id) {
+        return {
+            out: root.extCacheDir + "/" + id + ".out",
+            stamp: root.extCacheDir + "/" + id + ".stamp"
+        };
+    }
+
+    // Environment overrides for a source, as a shell assignment prefix.
+    //
+    // This exists because the widget's commands do NOT run in your shell. A
+    // plugin Process inherits the DMS service environment, which has no
+    // ~/.zshrc in it — so a toolchain installed by a version manager (nvm,
+    // pyenv, rbenv, asdf) resolves to a DIFFERENT install here than the one you
+    // use in a terminal, and the widget ends up reporting updates for a package
+    // set you never touch. Values are emitted double-quoted so they can refer
+    // to $PATH and $HOME, which is the whole point of the feature.
+    function _envPrefix(p) {
+        if (!p || !p.env)
+            return "";
+        var parts = [];
+        for (var k in p.env)
+            parts.push(k + "=\"" + String(p.env[k]).replace(/"/g, "\\\"") + "\"");
+        return parts.length ? parts.join(" ") + " " : "";
+    }
+
+    // Applying an update makes that source's cached result wrong immediately,
+    // but its stamp still says "checked recently", so the next refresh skips it
+    // and the item sits in the list for up to minIntervalHours AFTER it was
+    // actually updated. Dropping the stamp forces a real re-check on the
+    // refresh that follows the run.
+    Process { id: extStampProc }
+    function _invalidateExtStamps(ids) {
+        if (!ids || ids.length === 0)
+            return;
+        var parts = [];
+        for (var i = 0; i < ids.length; i++)
+            parts.push(_shq(root._extPaths(ids[i]).stamp));
+        extStampProc.running = false;
+        extStampProc.command = ["sh", "-c", "rm -f " + parts.join(" ")];
+        extStampProc.running = true;
+    }
+
+    // The refresh script: stamp check, run, atomic write, stamp — per provider,
+    // all inside one lock so concurrent instances don't duplicate the work.
+    function _extRefreshScript() {
+        var ps = root.extActiveProviders;
+        if (ps.length === 0)
+            return "";
+        var body = [];
+        for (var i = 0; i < ps.length; i++) {
+            var p = ps[i];
+            var f = root._extPaths(p.id);
+            var qOut = _shq(f.out);
+            var qStamp = _shq(f.stamp);
+            var cmd = root._envPrefix(p) + p.listCmd.map(_shq).join(" ");
+            var run = cmd + " > " + _shq(f.out + ".tmp") + " 2>/dev/null; "
+                + "mv -f " + _shq(f.out + ".tmp") + " " + qOut + "; "
+                + "touch " + qStamp + ";";
+            var secs = Math.floor((p.minIntervalMs || 0) / 1000);
+            if (secs > 0) {
+                // Skip while the previous result is still inside its window.
+                // The trailing ";" after "fi" matters: these fragments are
+                // concatenated, and without it the next provider's command
+                // parses as an argument to fi and the whole script dies.
+                body.push("if [ ! -f " + qStamp + " ] || "
+                    + "[ $(( $(date +%s) - $(date -r " + qStamp + " +%s) )) -ge " + secs + " ]; "
+                    + "then " + run + " fi;");
+            } else {
+                body.push(run);
+            }
+        }
+        return "mkdir -p " + _shq(root.extCacheDir) + "; "
+            + "( flock -w 300 9 || exit 0; " + body.join(" ") + " ) 9> "
+            + _shq(root.extCacheDir + "/refresh.lock");
+    }
+
+    // The read script: emit every enabled provider's stored output, delimited.
+    function _extReadScript() {
+        var ps = root.extActiveProviders;
+        var parts = [];
+        for (var i = 0; i < ps.length; i++) {
+            var f = root._extPaths(ps[i].id);
+            parts.push("printf '%s%s\\n' " + _shq(root.extMarker) + " " + _shq(ps[i].id)
+                + "; cat " + _shq(f.out) + " 2>/dev/null");
+        }
+        return parts.join("; ");
+    }
+
+    property bool isCheckingExt: false
+
+    // A refresh pressed while a check is already running used to be swallowed
+    // silently: the button appeared dead, and since the external check can take
+    // ~15s the natural reaction is to press it again, then again. Remember the
+    // request and honour it when the current pass ends.
+    property bool _extRecheckQueued: false
+
+    function _startExtCheck() {
+        if (root.extActiveProviders.length === 0) {
+            root.extUpdates = ({});
+            return;
+        }
+        if (root.isCheckingExt) {
+            root._extRecheckQueued = true;
+            return;
+        }
+        root.isCheckingExt = true;
+        // Read first so stored results appear immediately, then refresh in the
+        // background and read once more to pick up anything new.
+        extReadProc.command = ["sh", "-c", root._extReadScript()];
+        extReadProc.running = true;
+    }
+
+    Process {
+        id: extReadProc
+        stdout: StdioCollector {
+            onStreamFinished: root._applyExtRead(text || "")
+        }
+        stderr: StdioCollector { onStreamFinished: {} }
+        onExited: {
+            if (root._extRefreshDone) {
+                root._extRefreshDone = false;
+                root.isCheckingExt = false;
+                if (root._extRecheckQueued) {
+                    root._extRecheckQueued = false;
+                    // Honour the press that arrived mid-pass, and force it:
+                    // whatever prompted it happened after the last check began.
+                    root._invalidateExtStamps(root.extActiveProviders.map(function (p) { return p.id; }));
+                    root._startExtCheck();
+                }
+                return;
+            }
+            // First read done — now refresh, then read again.
+            var script = root._extRefreshScript();
+            if (script === "") {
+                root.isCheckingExt = false;
+                return;
+            }
+            extRefreshProc.command = ["sh", "-c", script];
+            extRefreshProc.running = true;
+        }
+    }
+
+    property bool _extRefreshDone: false
+
+    Process {
+        id: extRefreshProc
+        stdout: StdioCollector { onStreamFinished: {} }
+        stderr: StdioCollector { onStreamFinished: {} }
+        onExited: {
+            // Whether the refresh succeeded, was skipped as fresh, or died with
+            // a disappearing instance, the follow-up read is the same and is
+            // always safe: it reports whatever is on disk right now.
+            root._extRefreshDone = true;
+            extReadProc.command = ["sh", "-c", root._extReadScript()];
+            extReadProc.running = true;
+        }
+    }
+
+    // Split the delimited read output and hand each section to its provider's
+    // parser. A provider with no stored output yet simply yields no items.
+    function _applyExtRead(text) {
+        var next = {};
+        var chunks = String(text || "").split(root.extMarker);
+        for (var i = 0; i < chunks.length; i++) {
+            var chunk = chunks[i];
+            var nl = chunk.indexOf("\n");
+            if (nl === -1)
+                continue;
+            var id = chunk.substring(0, nl).trim();
+            var p = root.extProvider(id);
+            if (!p)
+                continue;
+            try {
+                next[id] = root._providerParse(p, chunk.substring(nl + 1));
+            } catch (e) {
+                // A broken external source must never take down the Shelly
+                // counts — drop its results and keep going.
+                next[id] = [];
+            }
+        }
+        root.extUpdates = next;
+    }
+
     Process {
         id: checkProc
         stdout: StdioCollector {
@@ -964,7 +1969,22 @@ PluginComponent {
         // so background checks on other monitors wait rather than colliding.
         // The resource prefix (nice/ionice/job-limit) is inherited by every
         // build child that shelly spawns, keeping the desktop responsive.
-        var cmd = "flock -w 300 " + lockPath + " " + _resourcesPrefix() + full.join(" ");
+        root._runTerminalShell(root._lockedCmd(full.join(" ")), title, forceInteractive);
+    }
+
+    // Wrap one already-joined command line in the shelly lock + resource prefix.
+    function _lockedCmd(cmdString) {
+        return "flock -w 300 " + lockPath + " " + _resourcesPrefix() + cmdString;
+    }
+
+    // The terminal-launching half of runInTerminal, split out so callers that
+    // build their own command line (Update All chaining external providers)
+    // reuse the exact same logging, completion-marker and survive-restart
+    // machinery instead of a parallel implementation. forceKeepOpen holds the
+    // window on a "Press Enter" prompt regardless of closeTerminalOnDone.
+    function _runTerminalShell(cmd, title, forceKeepOpen) {
+        if (isUpgrading)
+            return;
         // When failure detection is on, record the session with `script` (a real
         // pty, so the run stays fully interactive — sudo/confirm prompts and
         // progress bars still work) and stash the command's exit code. When off,
@@ -986,7 +2006,7 @@ PluginComponent {
         // Interactive runs (the per-package "run in terminal" buttons) always hold
         // the window open on a "Press Enter" prompt so the user can read whatever
         // output was produced, regardless of the global closeTerminalOnDone setting.
-        var keepOpen = !closeTerminalOnDone || forceInteractive === true;
+        var keepOpen = !closeTerminalOnDone || forceKeepOpen === true;
         var body = keepOpen
             ? work + "; " + doneCmd + "; echo; echo '── " + (title || "Done") + " ── Press Enter to close'; read _"
             : work;
@@ -1073,14 +2093,48 @@ PluginComponent {
         return items.map(function (i) { return i.name; });
     }
 
+    // Only the Shelly-managed items. Failure detection parses pacman/makepkg
+    // logs, so external providers are deliberately kept out of it.
+    function shellyShownItems() {
+        return root.pacmanUpdatesShown
+            .concat(root.enableAur ? root.aurUpdatesShown : [])
+            .concat(root.enableFlatpak ? root.flatpakUpdates : [])
+            .concat(root.enableAppimage ? root.appimageUpdates : []);
+    }
+
+    // Providers Update All is allowed to touch: enabled, not read-only, and
+    // with something pending. Read-only providers (firmware) are NEVER swept up
+    // in a bulk run — they only apply through their own explicit hand-off.
+    readonly property var extSweepProviders: extActiveProviders.filter(
+        p => !p.readOnly && root.extItems(p.id).length > 0)
+
     function updateAll() {
         // Shelly v3: `upgrade all` (was `upgrade-all`); --no-* still valid here.
         var args = ["shelly", "upgrade", "all"];
         if (!enableAur) args.push("--no-aur");
         if (!enableFlatpak) args.push("--no-flatpak");
         if (!enableAppimage) args.push("--no-appimage");
-        _beginUpgrade(_namesOf(allShownItems()));
-        runInTerminal(args, "Update All", hasKernelUpdate);
+        if (confirmations !== true && !(alwaysConfirmKernel && hasKernelUpdate))
+            args.push("--no-confirm");
+        _beginUpgrade(_namesOf(shellyShownItems()));
+        // Chain each sweepable external provider into the SAME terminal session
+        // after the Shelly run. Separated by ';' (not '&&') so a failing source
+        // doesn't cancel the rest — they're independent of each other.
+        var cmd = root._lockedCmd(args.join(" "));
+        var sweep = root.extSweepProviders;
+        root._invalidateExtStamps(sweep.map(function (sp) { return sp.id; }));
+        for (var i = 0; i < sweep.length; i++)
+            cmd += "; echo; echo '── " + sweep[i].label + " ──'; "
+                + root._envPrefix(sweep[i]) + sweep[i].applyAll.map(_shq).join(" ");
+        root._runTerminalShell(cmd, "Update All", false);
+    }
+
+    // Apply everything from one external provider.
+    function updateExt(p) {
+        if (!p || !p.applyAll)
+            return;
+        root._invalidateExtStamps([p.id]);
+        root._runTerminalShell(root._envPrefix(p) + p.applyAll.map(_shq).join(" "), p.label, true);
     }
     function updatePacman() {
         _beginUpgrade(_namesOf(pacmanUpdatesShown));
@@ -1100,6 +2154,18 @@ PluginComponent {
     }
 
     function updateOne(item) {
+        // External providers own their per-item command. They skip
+        // _beginUpgrade (failure detection is Shelly-only) and always keep the
+        // terminal open so the tool's own prompts and output stay readable.
+        var ext = root.extProvider(item.source);
+        if (ext) {
+            var argv = root._applyOneArgv(ext, item);
+            if (!argv || argv.length === 0)
+                return;
+            root._invalidateExtStamps([ext.id]);
+            root._runTerminalShell(root._envPrefix(ext) + argv.map(_shq).join(" "), item.name, true);
+            return;
+        }
         // Shelly v3 grammar: `update <type> <name>` (was `<type> update <name>`).
         var args;
         if (item.source === "pacman")
@@ -1469,9 +2535,16 @@ PluginComponent {
             if (r.OutOfDate)
                 add("Flagged out of date", root._fmtDate(r.OutOfDate));
         } else {
-            add("Source", item.source);
-            add("Version", verArrow, true);
+            var extP = root.extProvider(item.source);
+            add("Source", extP ? extP.label : item.source);
+            // Sources without a version pair render their own summary line.
+            add("Version", item.versionText ? item.versionText : verArrow, true);
             add("Repository", item.repository);
+            if (extP) {
+                add("Identifier", item.id, true);
+                if (extP.readOnly)
+                    add("Note", extP.note || "Applied outside the widget");
+            }
         }
         return { title: item.name, source: item.source, description: desc, fields: fields };
     }
@@ -2207,6 +3280,7 @@ PluginComponent {
         envProc.running = true; // detect {environment} for AI prompts
         shellyVerProc.running = true; // detect Shelly major version (v3+ required)
         newsProc.running = true; // fetch Arch news for the pre-update banner
+        extSourcesProc.running = true; // user sources, then binary detection
         // pluginService is usually NULL here (assigned after) — _loadPersistedState
         // no-ops then and re-runs from onPluginServiceChanged below.
         _loadPersistedState();
@@ -2429,8 +3503,10 @@ PluginComponent {
             lines.push("Flatpak: " + flatpakUpdates.length);
         if (enableAppimage)
             lines.push("AppImage: " + appimageUpdates.length);
-        if (ignoredPackages.length > 0)
-            lines.push("Held: " + ignoredPackages.length);
+        for (var p = 0; p < extActiveProviders.length; p++)
+            lines.push(extActiveProviders[p].label + ": " + extItems(extActiveProviders[p].id).length);
+        if (heldEntries.length > 0)
+            lines.push("Held: " + heldEntries.length);
         if (tooltipShowPackages && updateCount > 0) {
             var all = allShownItems();
             lines.push("");
@@ -2447,6 +3523,9 @@ PluginComponent {
     // An optional itemSubtitle adds a second, muted line and grows the row.
     component MenuItem: Rectangle {
         property string itemIcon: ""
+        // Update-source id (pacman, aur, dmsPlugins, …). When set, the row
+        // shows that source's brand logo and itemIcon becomes the fallback.
+        property string itemSourceId: ""
         property string itemLabel: ""
         property string itemSubtitle: ""
         property string badge: ""
@@ -2463,11 +3542,12 @@ PluginComponent {
             anchors.rightMargin: Theme.spacingS
             anchors.verticalCenter: parent.verticalCenter
             spacing: Theme.spacingM
-            DankIcon {
+            SourceIcon {
                 anchors.verticalCenter: parent.verticalCenter
-                name: itemIcon
-                size: Theme.iconSize - 2
-                color: Theme.surfaceText
+                sourceId: itemSourceId
+                fallbackIcon: itemIcon
+                iconSize: Theme.iconSize - 2
+                fallbackColor: root.menuIconColor
             }
             Column {
                 anchors.verticalCenter: parent.verticalCenter
@@ -2828,7 +3908,13 @@ PluginComponent {
                 spacing: Theme.spacingS
                 StyledText {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: root._externalBusy ? "Locked" : (root.isChecking ? "Checking…" : (root.updateCount === 0 ? "Up to date" : root.updateCount + (root.updateCount === 1 ? " update" : " updates")))
+                    // Keep showing the count while only the external check is
+                    // running — the spinning refresh icon already says work is
+                    // in progress, and blanking a known count to "Checking…"
+                    // for ~15s every cycle loses more than it tells you.
+                    // "Checking…" still wins when the count is 0, so a partial
+                    // pass can't flash a premature "Up to date".
+                    text: root._externalBusy ? "Locked" : (root.isChecking ? "Checking…" : ((root.updateCount === 0 && root.isCheckingExt) ? "Checking…" : (root.updateCount === 0 ? "Up to date" : root.updateCount + (root.updateCount === 1 ? " update" : " updates"))))
                     font.pixelSize: Theme.fontSizeMedium
                     color: root._externalBusy ? Theme.warning : (root.hasError ? Theme.error : Theme.surfaceVariantText)
                 }
@@ -2845,7 +3931,7 @@ PluginComponent {
                     onClicked: root.refreshAll()
                     RotationAnimation on rotation {
                         from: 0; to: 360; duration: 1000
-                        loops: Animation.Infinite; running: root.isChecking
+                        loops: Animation.Infinite; running: root.isChecking || root.isCheckingExt
                     }
                 }
             }
@@ -2945,6 +4031,71 @@ PluginComponent {
                 spacing: Theme.spacingXS
                 FailBannerButton { icon: "troubleshoot"; label: "Details"; onClicked: root.openFailures(false) }
                 FailBannerButton { icon: "description"; label: "Log"; onClicked: root.viewLastLog() }
+            }
+        }
+
+        // Rejected entries from the user's sources file. Shown here rather than
+        // folded into the widget's error state: a typo in an optional config
+        // file should not make the pill look like the system is broken, but it
+        // must not vanish either — a source that silently never appears is the
+        // worst possible way to debug that file.
+        Column {
+            width: uv.contentWidth
+            visible: !uv.embedded && root.extConfigErrors.length > 0
+            spacing: Theme.spacingXS
+
+            Rectangle {
+                width: parent.width
+                radius: Theme.cornerRadius
+                color: Theme.withAlpha(Theme.error, 0.10)
+                border.width: 1
+                border.color: Theme.withAlpha(Theme.error, 0.35)
+                height: cfgErrCol.implicitHeight + Theme.spacingM * 2
+                Column {
+                    id: cfgErrCol
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.margins: Theme.spacingM
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 2
+                    Row {
+                        spacing: Theme.spacingS
+                        DankIcon {
+                            anchors.verticalCenter: parent.verticalCenter
+                            name: "error"
+                            size: Theme.iconSize - 4
+                            color: Theme.error
+                        }
+                        StyledText {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.extConfigErrors.length === 1
+                                ? "1 update source was skipped"
+                                : root.extConfigErrors.length + " update sources were skipped"
+                            font.pixelSize: Theme.fontSizeSmall
+                            font.weight: Font.Medium
+                            color: Theme.error
+                        }
+                    }
+                    Repeater {
+                        model: root.extConfigErrors
+                        StyledText {
+                            required property var modelData
+                            width: cfgErrCol.width
+                            text: "• " + modelData
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                            wrapMode: Text.WordWrap
+                        }
+                    }
+                    StyledText {
+                        width: cfgErrCol.width
+                        text: root.extSourcesPath
+                        font.family: "monospace"
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        color: Theme.surfaceVariantText
+                        wrapMode: Text.WrapAnywhere
+                    }
+                }
             }
         }
 
@@ -3125,6 +4276,9 @@ PluginComponent {
                     // Per-package interactive update applies to everything but AppImage
                     // (which has no per-item interactive form).
                     readonly property bool rowCanInteractive: modelData.source === "pacman" || modelData.source === "aur" || modelData.source === "flatpak"
+                    // External providers (plugins, firmware, …) aren't Shelly
+                    // packages: no hold, no downgrade, no failure analysis.
+                    readonly property bool rowIsExt: root.extProvider(modelData.source) !== null
                     width: ListView.view ? ListView.view.width : 0
                     height: root.detailRowHeight
                     radius: Theme.cornerRadius
@@ -3146,6 +4300,8 @@ PluginComponent {
                             if (mouse.button === Qt.RightButton) {
                                 if (modelData.source === "pacman" || modelData.source === "aur")
                                     root.holdPackage(modelData.name);
+                                else if (root.extProvider(modelData.source))
+                                    root.holdExtItem(modelData);
                             } else {
                                 uv.rowActivated(modelData);
                             }
@@ -3160,18 +4316,39 @@ PluginComponent {
                         opacity: (rowIsDevel && !rowIsFailed) ? 0.55 : 1.0
 
                         Rectangle {
+                            // A state word (failed / kernel / devel) always wins
+                            // over the logo — those are warnings, and a brand
+                            // mark would bury them. Ordinary rows show the
+                            // source's logo instead of its name, on a plain
+                            // background so the mark isn't boxed in.
+                            readonly property bool chipIsState: rowIsFailed || rowIsKernel || rowIsDevel
                             anchors.verticalCenter: parent.verticalCenter
                             width: 52
                             height: 20
                             radius: Theme.cornerRadius
                             color: rowIsFailed ? Theme.withAlpha(Theme.error, 0.22)
-                                : (rowIsKernel ? Theme.withAlpha(Theme.warning, 0.22) : Theme.secondaryHover)
+                                : (rowIsKernel ? Theme.withAlpha(Theme.warning, 0.22)
+                                : (chipIsState ? Theme.secondaryHover : "transparent"))
                             StyledText {
                                 anchors.centerIn: parent
-                                text: rowIsFailed ? "failed" : (rowIsKernel ? "kernel" : (rowIsDevel ? "devel" : modelData.source))
+                                visible: parent.chipIsState
+                                text: rowIsFailed ? "failed" : (rowIsKernel ? "kernel" : "devel")
                                 font.pixelSize: Theme.fontSizeSmall - 1
                                 font.weight: (rowIsFailed || rowIsKernel) ? Font.Bold : Font.Normal
                                 color: rowIsFailed ? Theme.error : (rowIsKernel ? Theme.warning : Theme.surfaceVariantText)
+                            }
+                            SourceIcon {
+                                anchors.centerIn: parent
+                                visible: !parent.chipIsState
+                                sourceId: modelData.source
+                                // Sources with no bundled logo (firmware) fall
+                                // back to their descriptor's Material Symbol.
+                                fallbackIcon: {
+                                    var p = root.extProvider(modelData.source);
+                                    return p ? p.icon : "inventory_2";
+                                }
+                                iconSize: 20
+                                fallbackColor: root.rowIconColor
                             }
                         }
 
@@ -3192,10 +4369,25 @@ PluginComponent {
                             StyledText {
                                 width: parent.width
                                 text: {
-                                    var v = (modelData.oldVersion || "?") + " → " + (modelData.newVersion || "?");
+                                    // Sources with no version pair (DMS plugins
+                                    // are git checkouts) supply versionText and
+                                    // skip the "? → ?" placeholder entirely.
+                                    if (modelData.versionText)
+                                        return modelData.description
+                                            ? modelData.versionText + "  ·  " + modelData.description
+                                            : modelData.versionText;
+                                    // Some tools report only the available
+                                    // version (npm omits `current` for a
+                                    // partially-installed global), and "? → x"
+                                    // reads like an error rather than a fact.
+                                    var v = modelData.oldVersion
+                                        ? (modelData.oldVersion + " → " + (modelData.newVersion || "?"))
+                                        : (modelData.newVersion ? ("→ " + modelData.newVersion) : "update available");
                                     var ds = Number(modelData.downloadSize) || 0;
                                     if (ds > 0)
                                         v += "  ·  " + root._fmtBytes(ds);
+                                    else if (rowIsExt && modelData.description)
+                                        v += "  ·  " + modelData.description;
                                     return v;
                                 }
                                 font.pixelSize: Theme.fontSizeSmall
@@ -3435,27 +4627,43 @@ PluginComponent {
             onTriggered: { root.updateAll(); mv.dismissRequested(); }
         }
         MenuItem {
-            itemIcon: "terminal"; itemLabel: "Update System Packages (Pacman)"
+            itemIcon: "terminal"; itemSourceId: "pacman"; itemLabel: "Update System Packages (Pacman)"
             badge: root.pacmanUpdatesShown.length > 0 ? String(root.pacmanUpdatesShown.length) : ""
             onTriggered: { root.updatePacman(); mv.dismissRequested(); }
         }
         MenuItem {
             visible: root.enableAur; height: visible ? 44 : 0
-            itemIcon: "deployed_code"; itemLabel: "Update AUR"
+            itemIcon: "deployed_code"; itemSourceId: "aur"; itemLabel: "Update AUR"
             badge: root.aurUpdatesShown.length > 0 ? String(root.aurUpdatesShown.length) : ""
             onTriggered: { root.updateAur(); mv.dismissRequested(); }
         }
         MenuItem {
             visible: root.enableFlatpak; height: visible ? 44 : 0
-            itemIcon: "package_2"; itemLabel: "Update Flatpak"
+            itemIcon: "package_2"; itemSourceId: "flatpak"; itemLabel: "Update Flatpak"
             badge: root.flatpakUpdates.length > 0 ? String(root.flatpakUpdates.length) : ""
             onTriggered: { root.updateFlatpak(); mv.dismissRequested(); }
         }
         MenuItem {
             visible: root.enableAppimage; height: visible ? 44 : 0
-            itemIcon: "widgets"; itemLabel: "Update AppImage"
+            itemIcon: "widgets"; itemSourceId: "appimage"; itemLabel: "Update AppImage"
             badge: root.appimageUpdates.length > 0 ? String(root.appimageUpdates.length) : ""
             onTriggered: { root.updateAppimage(); mv.dismissRequested(); }
+        }
+        // One row per enabled external provider, straight off the descriptor
+        // list — adding a source never means touching this menu.
+        Repeater {
+            model: root.extActiveProviders
+            MenuItem {
+                required property var modelData
+                width: mv.contentWidth
+                itemIcon: modelData.icon
+                itemSourceId: modelData.id
+                itemLabel: "Update " + modelData.label
+                itemSubtitle: modelData.note
+                badge: root.extItems(modelData.id).length > 0
+                    ? String(root.extItems(modelData.id).length) : ""
+                onTriggered: { root.updateExt(modelData); mv.dismissRequested(); }
+            }
         }
 
         Rectangle { width: mv.contentWidth; height: 1; color: Theme.outline; opacity: 0.3 }
@@ -3469,7 +4677,7 @@ PluginComponent {
         MenuItem {
             visible: !mv.embedded; height: visible ? 44 : 0
             itemIcon: "block"; itemLabel: "Held Packages…"
-            badge: root.ignoredPackages.length > 0 ? String(root.ignoredPackages.length) : ""
+            badge: root.heldEntries.length > 0 ? String(root.heldEntries.length) : ""
             onTriggered: root.openHeld()
         }
         MenuItem {
@@ -3718,9 +4926,14 @@ PluginComponent {
         Row {
             width: dv.contentWidth
             spacing: Theme.spacingS
-            readonly property bool isHeld: dv.pkg ? root._isHeld(dv.pkg.name) : false
-            // ignore/downgrade apply to pacman/AUR, not flatpak/appimage.
-            readonly property bool canHold: dv.pkg && (dv.pkg.source === "pacman" || dv.pkg.source === "aur")
+            readonly property bool isExt: dv.pkg ? (root.extProvider(dv.pkg.source) !== null) : false
+            readonly property bool isHeld: dv.pkg
+                ? (isExt ? root._isExtHeld(dv.pkg) : root._isHeld(dv.pkg.name))
+                : false
+            // Hold covers pacman/AUR (via shelly) and every non-Shelly source
+            // (locally); downgrade is pacman-only.
+            readonly property bool canHold: dv.pkg && (dv.pkg.source === "pacman" || dv.pkg.source === "aur"
+                || root.extProvider(dv.pkg.source) !== null)
             // v3: AUR downgrade needs a commit-picker (2.1.0) — standard only for now.
             readonly property bool canDowngrade: dv.pkg && dv.pkg.source === "pacman"
 
@@ -3730,7 +4943,12 @@ PluginComponent {
                 icon: parent.isHeld ? "check_circle" : "block"
                 label: parent.isHeld ? "Unhold" : "Hold"
                 onTriggered: {
-                    if (parent.isHeld)
+                    if (parent.isExt) {
+                        if (parent.isHeld)
+                            root.unholdExtKey(root._extHoldKey(dv.pkg));
+                        else
+                            root.holdExtItem(dv.pkg);
+                    } else if (parent.isHeld)
                         root.unholdPackage(dv.pkg.name);
                     else
                         root.holdPackage(dv.pkg.name);
@@ -3953,10 +5171,10 @@ PluginComponent {
                         anchors.centerIn: parent
                         name: "refresh"
                         size: Theme.iconSize - 6
-                        color: root.isChecking ? Theme.primary : Theme.surfaceText
+                        color: (root.isChecking || root.isCheckingExt) ? Theme.primary : Theme.surfaceText
                         RotationAnimation on rotation {
                             from: 0; to: 360; duration: 1000
-                            loops: Animation.Infinite; running: root.isChecking
+                            loops: Animation.Infinite; running: root.isChecking || root.isCheckingExt
                             onRunningChanged: { if (!running) ccRefreshIcon.rotation = 0; }
                         }
                     }
@@ -5146,7 +6364,7 @@ PluginComponent {
             // onCompleted/onDestruction latch went stale — leaving popoutOpen
             // stuck true and swallowing the first click of the opposite button.
             Component.onCompleted: {
-                if (root.popoutMode === "updates" && root.updateCount === 0 && !root.isChecking)
+                if (root.popoutMode === "updates" && root.updateCount === 0 && !root.isChecking && !root.isCheckingExt)
                     root.refresh(false);
             }
             Component.onDestruction: root.popoutOpen = false
@@ -5160,7 +6378,7 @@ PluginComponent {
                 function onShouldBeVisibleChanged() {
                     const vis = popout.parentPopout.shouldBeVisible;
                     root.popoutOpen = vis;
-                    if (vis && root.popoutMode === "updates" && root.updateCount === 0 && !root.isChecking)
+                    if (vis && root.popoutMode === "updates" && root.updateCount === 0 && !root.isChecking && !root.isCheckingExt)
                         root.refresh(false);
                 }
             }
@@ -5287,8 +6505,8 @@ PluginComponent {
                         width: parent.width - Theme.spacingL * 2
                         horizontalAlignment: Text.AlignHCenter
                         wrapMode: Text.WordWrap
-                        visible: root.ignoredPackages.length === 0
-                        text: "No held packages.\nRight-click a package in the updates list, or use Hold in its details, to pin it here."
+                        visible: root.heldEntries.length === 0
+                        text: "No held packages.\nRight-click anything in the updates list, or use Hold in its details, to pin it here."
                         color: Theme.surfaceText
                         font.pixelSize: Theme.fontSizeMedium
                     }
@@ -5296,10 +6514,10 @@ PluginComponent {
                     DankListView {
                         anchors.fill: parent
                         anchors.margins: Theme.spacingS
-                        visible: root.ignoredPackages.length > 0
+                        visible: root.heldEntries.length > 0
                         clip: true
                         spacing: Theme.spacingXS
-                        model: root.ignoredPackages
+                        model: root.heldEntries
 
                         delegate: Rectangle {
                             required property var modelData
@@ -5316,7 +6534,7 @@ PluginComponent {
                                 anchors.right: unholdBtn.left
                                 anchors.rightMargin: Theme.spacingS
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: modelData
+                                text: modelData.label
                                 font.pixelSize: Theme.fontSizeMedium
                                 color: Theme.surfaceText
                                 elide: Text.ElideRight
@@ -5330,7 +6548,8 @@ PluginComponent {
                                 iconName: "delete"
                                 iconSize: 18
                                 iconColor: Theme.error
-                                onClicked: root.unholdPackage(modelData)
+                                onClicked: modelData.isExt ? root.unholdExtKey(modelData.key)
+                                                           : root.unholdPackage(modelData.key)
                             }
                         }
                     }

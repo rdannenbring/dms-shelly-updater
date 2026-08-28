@@ -543,6 +543,44 @@ PluginSettings {
         }
         ToggleSetting { settingKey: "enableFlatpak"; label: "Flatpak"; description: "Include Flatpak applications."; defaultValue: true }
         ToggleSetting { settingKey: "enableAppimage"; label: "AppImage"; description: "Include AppImages managed by Shelly."; defaultValue: false }
+
+        SectionHeader {
+            title: "Beyond Shelly"
+            subtitle: "Extra update sources that Shelly doesn't manage. Each one is skipped automatically when its command isn't installed, so leaving it on costs nothing."
+        }
+        ToggleSetting {
+            settingKey: "enableDmsPlugins"
+            label: "DMS plugins"
+            description: "Include updates to your installed DankMaterialShell plugins (needs the 'dms' CLI). Shelly Updater never updates itself this way — use Settings → Plugins for that."
+            defaultValue: true
+        }
+        ToggleSetting {
+            settingKey: "skipDevPlugins"
+            label: "Ignore plugins you're developing"
+            description: "Skip DMS plugins whose folder is a symlink. A symlink means a local development checkout, so it follows your own fork or branch and can never match what the registry compares it against — without this it sits in the list permanently, reported as updatable but impossible to update. Turn off to see them anyway."
+            defaultValue: true
+        }
+        ToggleSetting {
+            settingKey: "enableFirmware"
+            label: "Device firmware"
+            description: "Include firmware updates reported by fwupd/LVFS (needs 'fwupdmgr'). Listing only — firmware is never applied silently or as part of Update All; it always opens a terminal and runs fwupdmgr's own prompts."
+            defaultValue: true
+        }
+        SectionHeader {
+            title: "Your own sources"
+            subtitle: "Any other tool that can list what's outdated can be added without touching code. mise and Rust toolchains ship as entries in this file — copy one as a starting point. Reload the plugin after editing."
+        }
+        CopyableCommand {
+            command: "~/.config/DankMaterialShell/shelly-updater-sources.json"
+            copyText: "~/.config/DankMaterialShell/shelly-updater-sources.json"
+        }
+        StyledText {
+            width: parent.width
+            text: "Each entry names a command to run, how to read its output (a regex or a JSON field map), and how to apply an update. Entries whose command isn't installed are skipped silently; entries with mistakes in them are skipped with the reason shown in the updates view. Because these run commands as you, treat a sources file from someone else the way you'd treat their shell script."
+            font.pixelSize: Theme.fontSizeSmall
+            color: Theme.surfaceVariantText
+            wrapMode: Text.WordWrap
+        }
     }
 
     // ==== Tab 4: Look (Appearance / Detailed View / Tooltip) ============
@@ -552,6 +590,12 @@ PluginSettings {
         spacing: Theme.spacingM
 
         SectionHeader { title: "Appearance" }
+        ToggleSetting {
+            settingKey: "tintSourceLogos"
+            label: "Tint icons with theme color"
+            description: "Draw the menu and update-row icons in your theme's accent color — both the source logos (Pacman, Arch, Flatpak, AppImage, Dank, mise, Rust) and the plain symbols beside them, so the menu reads as one palette. Turn off for brand-colored logos and neutral symbols."
+            defaultValue: true
+        }
         IconSetting {
             settingKey: "iconDefault"
             label: "Icon — up to date"
