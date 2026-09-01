@@ -43,8 +43,12 @@ off as worked examples to copy. See [Adding your own sources](#adding-your-own-s
     a branch with no counterpart on `origin`, tracking a fork, or carrying local edits or unpushed
     commits. `dms plugins update` pulls the branch you're *on*, so for these it reports success and
     changes nothing, leaving them listed as updatable forever. Only local git refs are consulted, so
-    the test costs no network. Shelly Updater excludes *itself* separately — updating a plugin
-    rewrites its directory and DMS reloads it mid-run
+    the test costs no network. Shelly Updater lists **its own** updates too
+    (**Offer updates to Shelly Updater**, on by default) — otherwise someone using this widget as
+    their one place to see what needs updating would never learn the widget itself is behind.
+    Updating it rewrites its own folder and DMS reloads it, so it is never included in *Update All*;
+    it is updated deliberately from its own row. Switch it off and the updates view still tells you
+    when a new version is out
   - **Device firmware** (`fwupdmgr`) — fwupd/LVFS updates. **Listing only**: firmware is never applied
     silently and is never swept up by *Update All*. Applying it always opens a terminal and runs
     `fwupdmgr`'s own prompts, because a bad flash is the one update here that can brick hardware

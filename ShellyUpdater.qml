@@ -67,6 +67,11 @@ PluginComponent {
     // one), so it tracks your own fork or branch and can never match what the
     // registry compares it against — it would sit in the list permanently,
     // reported as updatable but impossible to update.
+    // Offer updates to this plugin like any other. Off hides it from the list
+    // and the count, but an update is still announced in the updates view —
+    // a user who relies on this widget to know what needs updating would
+    // otherwise never hear that the widget itself is out of date.
+    readonly property bool includeSelfUpdate: _pd.includeSelfUpdate !== undefined ? _pd.includeSelfUpdate : true
     readonly property bool skipDevPlugins: _pd.skipDevPlugins !== undefined ? _pd.skipDevPlugins : true
     readonly property bool tintSourceLogos: _pd.tintSourceLogos !== undefined ? _pd.tintSourceLogos : true
     // A logo and the Material Symbol standing in for a source with no logo
@@ -427,8 +432,7 @@ PluginComponent {
                 pattern: "^Update available for plugin:\\s*(.+?)\\s*\\(ID:\\s*([^)]+)\\)\\s*$",
                 name: 1,
                 id: 2,
-                versionText: "update available",
-                exclude: ["shellyUpdater"]
+                versionText: "update available"
             },
             applyAll: ["dms", "plugins", "update", "--all"],
             applyOne: ["dms", "plugins", "update", "{id}"],
@@ -726,9 +730,21 @@ PluginComponent {
     }
     function extItems(id) {
         var all = root.extUpdates[id] || [];
+        if (id === "dmsPlugins" && !root.includeSelfUpdate)
+            all = all.filter(function (it) { return it.id !== root.pluginName; });
         if (root.extHeld.length === 0)
             return all;
         return all.filter(function (it) { return !root._isExtHeld(it); });
+    }
+
+    // Is an update to THIS plugin waiting? Read from the raw results, so it
+    // stays true even when the setting keeps it out of the list.
+    readonly property bool selfUpdateAvailable: {
+        var raw = root.extUpdates["dmsPlugins"] || [];
+        for (var i = 0; i < raw.length; i++)
+            if (raw[i].id === root.pluginName)
+                return true;
+        return false;
     }
     readonly property var extActiveProviders: extProviders.filter(p => root.extEnabled(p))
     readonly property int extCount: {
@@ -2178,6 +2194,12 @@ PluginComponent {
             return "";
         var env = root._envPrefix(p);
         var items = root.extItems(p.id);
+        // Updating this plugin rewrites its own directory and DMS reloads it the
+        // moment that lands, so it is never swept up in a bulk run — the widget
+        // would vanish mid-sequence. It stays individually updatable from its
+        // own row, where that is a deliberate choice.
+        if (p.id === "dmsPlugins")
+            items = items.filter(function (it) { return it.id !== root.pluginName; });
         if (p.applyOne && items.length > 0) {
             var parts = [];
             for (var i = 0; i < items.length; i++) {
@@ -4157,6 +4179,44 @@ PluginComponent {
                         color: Theme.surfaceVariantText
                         wrapMode: Text.WrapAnywhere
                     }
+                }
+            }
+        }
+
+        // Shelly Updater has an update but is set not to list it. Announced
+        // anyway: someone who uses this widget as their one place to see what
+        // needs updating would otherwise never learn the widget itself is
+        // behind, which is the one update it cannot report by being in the list.
+        Rectangle {
+            width: uv.contentWidth
+            visible: !uv.embedded && root.selfUpdateAvailable && !root.includeSelfUpdate
+            height: selfRow.implicitHeight + Theme.spacingM * 2
+            radius: Theme.cornerRadius
+            color: Theme.withAlpha(Theme.primary, 0.10)
+            border.width: 1
+            border.color: Theme.withAlpha(Theme.primary, 0.30)
+            Row {
+                id: selfRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.margins: Theme.spacingM
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingS
+                DankIcon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "system_update_alt"
+                    size: Theme.iconSize - 4
+                    color: Theme.primary
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.max(0, parent.width - (Theme.iconSize - 4) - Theme.spacingS)
+                    text: "An update to Shelly Updater is available. It is not listed above because "
+                        + "\"Offer updates to Shelly Updater\" is off — turn it on, or update from "
+                        + "DMS Settings → Plugins."
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceText
+                    wrapMode: Text.WordWrap
                 }
             }
         }

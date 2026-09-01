@@ -555,6 +555,12 @@ PluginSettings {
             defaultValue: true
         }
         ToggleSetting {
+            settingKey: "includeSelfUpdate"
+            label: "Offer updates to Shelly Updater"
+            description: "List this plugin's own updates alongside the others, so you find out about them here rather than only in DMS Settings. Updating it rewrites its own folder and DMS reloads it, so the widget will blink — for that reason it is never included in Update All, only updated deliberately from its own row. Turn off and you'll still get a notice in the updates view when one is available."
+            defaultValue: true
+        }
+        ToggleSetting {
             settingKey: "skipDevPlugins"
             label: "Ignore plugins you've customized"
             description: "Skip DMS plugins whose checkout an update can't actually move — one on a branch that isn't on its origin, tracking a fork, or carrying local edits or unpushed commits. For these, 'dms plugins update' pulls the branch you're on, reports success, and changes nothing, so they'd sit in the list permanently. Turn off to see them anyway."
