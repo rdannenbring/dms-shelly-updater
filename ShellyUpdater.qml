@@ -371,12 +371,99 @@ PluginComponent {
 
     // One list for the Held view, so Shelly's ignore list and the local
     // non-Shelly holds are managed in the same place.
+    // A held item that has a pending update is worth surfacing: holding
+    // something silences it, and without this there is no way to notice that a
+    // package you pinned months ago has moved on. The raw per-source lists
+    // still contain held items — it is the "Shown"/extItems accessors that
+    // filter them — so this reads from those.
+    //
+    // Returns { key, name, source, oldVersion, newVersion, versionText }.
+    readonly property var heldUpdates: {
+        var out = [];
+        function scanShelly(list, src) {
+            for (var i = 0; i < list.length; i++) {
+                var u = list[i];
+                if (!root._isHeld(u))
+                    continue;
+                out.push({ key: u.name, name: u.name, source: src,
+                           oldVersion: u.oldVersion, newVersion: u.newVersion,
+                           versionText: u.versionText || "" });
+            }
+        }
+        scanShelly(root.pacmanUpdates, "pacman");
+        if (root.enableAur)
+            scanShelly(root.aurUpdatesEffective, "aur");
+        if (root.enableFlatpak)
+            scanShelly(root.flatpakUpdates, "flatpak");
+        if (root.enableAppimage)
+            scanShelly(root.appimageUpdates, "appimage");
+        var ps = root.extActiveProviders;
+        for (var p = 0; p < ps.length; p++) {
+            var raw = root.extUpdates[ps[p].id] || [];
+            for (var k = 0; k < raw.length; k++) {
+                var it = raw[k];
+                if (!root._isExtHeld(it))
+                    continue;
+                out.push({ key: root._extHoldKey(it), name: it.name, source: ps[p].id,
+                           oldVersion: it.oldVersion, newVersion: it.newVersion,
+                           versionText: it.versionText || "" });
+            }
+        }
+        return out;
+    }
+
+    // [{ source, label, count }] in the list's own sort order, for the summary.
+    readonly property var heldUpdateCounts: {
+        var byId = {}, order = [];
+        for (var i = 0; i < root.heldUpdates.length; i++) {
+            var src = root.heldUpdates[i].source;
+            if (byId[src] === undefined) {
+                byId[src] = 0;
+                order.push(src);
+            }
+            byId[src]++;
+        }
+        order.sort(function (a, b) {
+            return root._typeRank({ source: a }) - root._typeRank({ source: b });
+        });
+        var out = [];
+        for (var j = 0; j < order.length; j++) {
+            var p = root.extProvider(order[j]);
+            out.push({ source: order[j], label: p ? p.label : order[j], count: byId[order[j]] });
+        }
+        return out;
+    }
+
+    function _heldHasUpdate(key) {
+        for (var i = 0; i < root.heldUpdates.length; i++)
+            if (root.heldUpdates[i].key === key)
+                return true;
+        return false;
+    }
+    function _heldUpdateFor(key) {
+        for (var i = 0; i < root.heldUpdates.length; i++)
+            if (root.heldUpdates[i].key === key)
+                return root.heldUpdates[i];
+        return null;
+    }
+
     readonly property var heldEntries: {
         var out = [];
         for (var i = 0; i < root.ignoredPackages.length; i++)
-            out.push({ key: root.ignoredPackages[i], label: root.ignoredPackages[i], isExt: false });
+            out.push({ key: root.ignoredPackages[i], label: root.ignoredPackages[i], isExt: false,
+                       hasUpdate: root._heldHasUpdate(root.ignoredPackages[i]),
+                       upd: root._heldUpdateFor(root.ignoredPackages[i]) });
         for (var j = 0; j < root.extHeld.length; j++)
-            out.push({ key: root.extHeld[j], label: root.extHoldLabel(root.extHeld[j]), isExt: true });
+            out.push({ key: root.extHeld[j], label: root.extHoldLabel(root.extHeld[j]), isExt: true,
+                       hasUpdate: root._heldHasUpdate(root.extHeld[j]),
+                       upd: root._heldUpdateFor(root.extHeld[j]) });
+        // Held items with something waiting sort to the top — that is the whole
+        // reason to open this view.
+        out.sort(function (a, b) {
+            if (a.hasUpdate !== b.hasUpdate)
+                return a.hasUpdate ? -1 : 1;
+            return String(a.label).localeCompare(String(b.label));
+        });
         return out;
     }
 
@@ -690,7 +777,15 @@ PluginComponent {
             "  d=" + _shq(dir) + '/"$id"; keep=1',
             '  if [ -d "$d/.git" ]; then',
             '    br=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)',
-            '    git -C "$d" rev-parse --verify -q "refs/remotes/origin/$br" >/dev/null 2>&1 || keep=0',
+            // A detached HEAD has no branch to compare, and is what a pinned
+            // install looks like. Judge it by reachability instead (the
+            // unpushed-commits test below): detached at a commit that exists
+            // upstream is a normal install, detached at a local-only commit is
+            // not. Testing the literal name "HEAD" against origin/HEAD would
+            // decide it on whether that ref happens to exist.
+            '    if [ "$br" != HEAD ]; then',
+            '      git -C "$d" rev-parse --verify -q "refs/remotes/origin/$br" >/dev/null 2>&1 || keep=0',
+            "    fi",
             '    up=$(git -C "$d" rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null)',
             '    case "$up" in ""|origin/*) ;; *) keep=0 ;; esac',
             '    [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ] && keep=0',
@@ -1406,7 +1501,12 @@ PluginComponent {
         // flags still skip the slow AUR RPC / flatpak calls when disabled.
         var q = [{ src: "pacman", cmd: ["shelly", "list-updates", "standard", "--json"] }];
         if (enableAur)
-            q.push({ src: "aur", cmd: ["shelly", "list-updates", "aur", "--json"] });
+            // --show-hidden keeps packages on shelly's ignore list in the
+            // results. They are still filtered out of the displayed list by
+            // aurUpdatesShown; the point is to KNOW a held package has moved,
+            // which is what the held-updates summary reports. Without it shelly
+            // omits ignored packages entirely and a hold becomes a blindfold.
+            q.push({ src: "aur", cmd: ["shelly", "list-updates", "aur", "--show-hidden", "--json"] });
         if (enableFlatpak)
             q.push({ src: "flatpak", cmd: ["shelly", "list-updates", "flatpak", "--json"] });
         if (enableAppimage)
@@ -4044,6 +4144,77 @@ PluginComponent {
             }
         }
 
+        // Held items that have moved on. Holding something takes it out of the
+        // count and the list, which is the point — but it also means a package
+        // pinned months ago can go stale unnoticed. This is the one place that
+        // says so, and it only appears when a held item actually has an update
+        // waiting. Clicking opens the held list, where those sort to the top.
+        Rectangle {
+            width: uv.contentWidth
+            visible: !uv.embedded && root.heldUpdates.length > 0
+            height: visible ? 42 : 0
+            radius: Theme.cornerRadius
+            color: heldSummaryHover.containsMouse ? Theme.primaryHoverLight
+                                                  : Theme.withAlpha(Theme.warning, 0.10)
+            border.width: 1
+            border.color: Theme.withAlpha(Theme.warning, 0.30)
+            Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+
+            MouseArea {
+                id: heldSummaryHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.openMode("held")
+            }
+
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.spacingM
+                anchors.right: heldChevron.left
+                anchors.rightMargin: Theme.spacingXS
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.spacingS
+
+                DankIcon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "block"
+                    size: Theme.iconSize - 6
+                    color: Theme.warning
+                }
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.heldUpdates.length + (root.heldUpdates.length === 1
+                        ? " held package has an update" : " held packages have updates")
+                    font.pixelSize: Theme.fontSizeSmall
+                    font.weight: Font.Medium
+                    color: Theme.surfaceText
+                }
+                // Per-type breakdown, e.g. "pacman 2 · aur 1".
+                StyledText {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: {
+                        var parts = [];
+                        for (var i = 0; i < root.heldUpdateCounts.length; i++)
+                            parts.push(root.heldUpdateCounts[i].label + " " + root.heldUpdateCounts[i].count);
+                        return parts.join("  ·  ");
+                    }
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    elide: Text.ElideRight
+                }
+            }
+            DankIcon {
+                id: heldChevron
+                anchors.right: parent.right
+                anchors.rightMargin: Theme.spacingM
+                anchors.verticalCenter: parent.verticalCenter
+                name: "chevron_right"
+                size: Theme.iconSize - 6
+                color: Theme.surfaceVariantText
+            }
+        }
+
         // Text filter — search the update list by package name,
         // description, version or source. Shown only when there is
         // something to filter. Hidden when embedded (the CC panel keeps the
@@ -6643,23 +6814,52 @@ PluginComponent {
 
                         delegate: Rectangle {
                             required property var modelData
+                            // A held package with something waiting is the
+                            // reason to be looking at this list, so it carries
+                            // the version it would move to and a warning tint.
+                            id: heldRow
+                            readonly property bool pending: modelData.hasUpdate === true
                             width: ListView.view ? ListView.view.width : 0
                             height: 44
                             radius: Theme.cornerRadius
-                            color: heldHover.containsMouse ? Theme.primaryHoverLight : "transparent"
+                            color: heldHover.containsMouse ? Theme.primaryHoverLight
+                                : (pending ? Theme.withAlpha(Theme.warning, 0.12) : "transparent")
+                            border.width: pending ? 1 : 0
+                            border.color: Theme.withAlpha(Theme.warning, 0.35)
                             Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
                             MouseArea { id: heldHover; anchors.fill: parent; hoverEnabled: true }
 
-                            StyledText {
+                            Column {
                                 anchors.left: parent.left
                                 anchors.leftMargin: Theme.spacingM
                                 anchors.right: unholdBtn.left
                                 anchors.rightMargin: Theme.spacingS
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: modelData.label
-                                font.pixelSize: Theme.fontSizeMedium
-                                color: Theme.surfaceText
-                                elide: Text.ElideRight
+                                spacing: 1
+                                StyledText {
+                                    width: parent.width
+                                    text: modelData.label
+                                    font.pixelSize: Theme.fontSizeMedium
+                                    color: Theme.surfaceText
+                                    elide: Text.ElideRight
+                                }
+                                StyledText {
+                                    width: parent.width
+                                    visible: heldRow.pending
+                                    text: {
+                                        var u = modelData.upd;
+                                        if (!u)
+                                            return "";
+                                        if (u.versionText)
+                                            return u.versionText + " (held)";
+                                        if (u.oldVersion)
+                                            return u.oldVersion + " → " + (u.newVersion || "?") + " (held)";
+                                        return u.newVersion ? ("→ " + u.newVersion + " (held)") : "update available (held)";
+                                    }
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.warning
+                                    elide: Text.ElideRight
+                                }
                             }
                             DankActionButton {
                                 id: unholdBtn

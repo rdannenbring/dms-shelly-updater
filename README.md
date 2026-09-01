@@ -69,6 +69,12 @@ off as worked examples to copy. See [Adding your own sources](#adding-your-own-s
 - **Menu** (default right click) — Update All, Update System (Pacman), Update AUR / Flatpak /
   AppImage (hidden when disabled), one row per enabled non-Shelly source, **Held Packages**, **Update History**, Clean Package Cache, Remove Orphans,
   Open Shelly UI, **Reset** (clear a stuck refresh/upgrade state), and Settings
+- **Held items that moved on** — a summary above the filter box counts held packages that now have
+  an update, broken down by source; clicking it opens the held list with those sorted to the top and
+  marked with the version they'd move to. Holding something silences it, and this is what stops a
+  package pinned months ago from going stale unnoticed. (pacman is the gap: `shelly list-updates
+  standard` has no way to report ignored packages, so held pacman packages can't be counted. AUR is
+  covered via `--show-hidden`, and non-Shelly sources are held locally so they're always visible.)
 - **Hold anything** — right-click an update (or use **Hold** in its details) to pin it out of the
   count and list. pacman and AUR packages go through `shelly mark ignore`; everything else is held
   locally by the plugin. Useful for a source that keeps reporting something it can't actually
