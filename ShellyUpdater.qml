@@ -371,6 +371,23 @@ PluginComponent {
 
     // One list for the Held view, so Shelly's ignore list and the local
     // non-Shelly holds are managed in the same place.
+    // Held pacman packages that have an update, from `pacman -Qu`:
+    //   archlinux-appstream-data 20260722-1 -> 20260821-1 [ignored]
+    // Only the [ignored] lines matter — the rest are ordinary updates already
+    // covered by the shelly check.
+    property var heldPacmanUpdates: []
+    function _parseHeldPacman(text) {
+        var out = [];
+        var lines = String(text || "").split("\n");
+        var re = /^(\S+)\s+(\S+)\s+->\s+(\S+)\s+\[ignored\]\s*$/;
+        for (var i = 0; i < lines.length; i++) {
+            var m = re.exec(lines[i].trim());
+            if (m)
+                out.push({ name: m[1], oldVersion: m[2], newVersion: m[3] });
+        }
+        return out;
+    }
+
     // A held item that has a pending update is worth surfacing: holding
     // something silences it, and without this there is no way to notice that a
     // package you pinned months ago has moved on. The raw per-source lists
@@ -391,6 +408,13 @@ PluginComponent {
             }
         }
         scanShelly(root.pacmanUpdates, "pacman");
+        // pacman's ignored packages never reach pacmanUpdates, so they come
+        // from their own query rather than being filtered out of that list.
+        for (var h = 0; h < root.heldPacmanUpdates.length; h++) {
+            var hp = root.heldPacmanUpdates[h];
+            out.push({ key: hp.name, name: hp.name, source: "pacman",
+                       oldVersion: hp.oldVersion, newVersion: hp.newVersion, versionText: "" });
+        }
         if (root.enableAur)
             scanShelly(root.aurUpdatesEffective, "aur");
         if (root.enableFlatpak)
@@ -1500,6 +1524,11 @@ PluginComponent {
         // Kept per-backend (not the combined `list-updates all`) so the enable
         // flags still skip the slow AUR RPC / flatpak calls when disabled.
         var q = [{ src: "pacman", cmd: ["shelly", "list-updates", "standard", "--json"] }];
+        // Held pacman packages, which shelly cannot report: `list-updates
+        // standard` takes no --show-hidden and omits ignored packages outright.
+        // pacman itself still lists them, tagged [ignored], so one local db
+        // read (no network, no per-package loop) recovers what shelly drops.
+        q.push({ src: "heldPacman", cmd: ["pacman", "-Qu"] });
         if (enableAur)
             // --show-hidden keeps packages on shelly's ignore list in the
             // results. They are still filtered out of the displayed list by
@@ -2064,6 +2093,10 @@ PluginComponent {
         stdout: StdioCollector {
             onStreamFinished: {
                 try {
+                    if (root._currentSrc === "heldPacman") {
+                        root.heldPacmanUpdates = root._parseHeldPacman(text);
+                        return;
+                    }
                     var parsed = root._parseInto(root._currentSrc, text);
                     if (root._currentSrc === "pacman")
                         root.pacmanUpdates = parsed;
@@ -2089,11 +2122,16 @@ PluginComponent {
             }
         }
         onExited: exitCode => {
-            if (exitCode !== 0 && !root.hasError) {
+            // `pacman -Qu` exits 1 simply to mean "nothing to report", which is
+            // a normal outcome here and must not light up the error state.
+            var benign = (root._currentSrc === "heldPacman" && exitCode === 1);
+            if (exitCode !== 0 && !benign && !root.hasError) {
                 root.hasError = true;
                 if (!root.errorMessage)
                     root.errorMessage = "shelly " + root._currentSrc + " exited with code " + exitCode;
             }
+            if (benign)
+                root.heldPacmanUpdates = [];
             root._runNextCheck();
         }
     }
