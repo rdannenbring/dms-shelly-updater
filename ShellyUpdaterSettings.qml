@@ -556,8 +556,8 @@ PluginSettings {
         }
         ToggleSetting {
             settingKey: "skipDevPlugins"
-            label: "Ignore plugins you're developing"
-            description: "Skip DMS plugins whose folder is a symlink. A symlink means a local development checkout, so it follows your own fork or branch and can never match what the registry compares it against — without this it sits in the list permanently, reported as updatable but impossible to update. Turn off to see them anyway."
+            label: "Ignore plugins you've customized"
+            description: "Skip DMS plugins whose checkout an update can't actually move — one on a branch that isn't on its origin, tracking a fork, or carrying local edits or unpushed commits. For these, 'dms plugins update' pulls the branch you're on, reports success, and changes nothing, so they'd sit in the list permanently. Turn off to see them anyway."
             defaultValue: true
         }
         ToggleSetting {

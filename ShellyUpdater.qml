@@ -655,19 +655,49 @@ PluginComponent {
     }
 
     // With skipDevPlugins on, filter the check's own output rather than
-    // post-processing it: each reported id is dropped when its plugin directory
-    // is a symlink. Lines without an "(ID: …)" are passed through untouched so
-    // the trailing summary line survives.
+    // post-processing it: a reported plugin is dropped when its checkout is one
+    // an update cannot actually move. Lines without an "(ID: …)" pass through
+    // untouched so the trailing summary line survives.
+    //
+    // The test is git state, not "is it a symlink". Symlinking was the wrong
+    // signal in both directions: DMS symlinks its OWN registry installs out of
+    // .repos/ for monorepo plugins (so the symlink test hid perfectly
+    // updatable plugins), while a local development checkout is just as often
+    // a plain clone.
+    //
+    // What actually matters is whether `dms plugins update` can move the
+    // checkout. It pulls the current branch, so if that branch tracks a fork or
+    // has no counterpart on origin, the pull succeeds, dms reports "updated
+    // successfully", and nothing changes — the plugin is then reported as
+    // outdated again forever. Local edits and unpushed commits are flagged for
+    // the same reason: an update would either fail or quietly discard them.
+    //
+    // Only local refs are consulted, so this costs no network and runs only for
+    // the handful of plugins that reported an update.
     function _dmsPluginsListCmd() {
         var plain = ["dms", "plugins", "update", "--all", "--check"];
         if (!root.skipDevPlugins)
             return plain;
         var dir = root.extSourcesDir + "/plugins";
-        return ["sh", "-c",
-            plain.map(_shq).join(" ") + " | while IFS= read -r l; do "
-            + "case \"$l\" in *\"(ID: \"*) id=${l##*\"(ID: \"}; id=${id%)} ;; "
-            + "*) printf '%s\\n' \"$l\"; continue ;; esac; "
-            + "[ -L " + _shq(dir) + "/\"$id\" ] || printf '%s\\n' \"$l\"; done"];
+        var script = [
+            plain.map(_shq).join(" ") + " | while IFS= read -r l; do",
+            '  case "$l" in *"(ID: "*) id=${l##*"(ID: "}; id=${id%)} ;;',
+            '    *) printf \'%s\\n\' "$l"; continue ;; esac',
+            "  d=" + _shq(dir) + '/"$id"; keep=1',
+            '  if [ -d "$d/.git" ]; then',
+            '    br=$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)',
+            '    git -C "$d" rev-parse --verify -q "refs/remotes/origin/$br" >/dev/null 2>&1 || keep=0',
+            '    up=$(git -C "$d" rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null)',
+            '    case "$up" in ""|origin/*) ;; *) keep=0 ;; esac',
+            '    [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ] && keep=0',
+            '    [ -n "$(git -C "$d" log --oneline --not --remotes 2>/dev/null | head -1)" ] && keep=0',
+            "  fi",
+            '  [ "$keep" = 1 ] && printf \'%s\\n\' "$l"',
+            "done"
+        // Real newlines, not spaces: `esac`, `fi` and `done` need a command
+        // separator after them, and a space is not one.
+        ].join("\n");
+        return ["sh", "-c", script];
     }
 
     function extProvider(id) {
@@ -2106,7 +2136,7 @@ PluginComponent {
     // with something pending. Read-only providers (firmware) are NEVER swept up
     // in a bulk run — they only apply through their own explicit hand-off.
     readonly property var extSweepProviders: extActiveProviders.filter(
-        p => !p.readOnly && root.extItems(p.id).length > 0)
+        p => !p.readOnly && (p.applyAll || p.applyOne) && root.extItems(p.id).length > 0)
 
     function updateAll() {
         // Shelly v3: `upgrade all` (was `upgrade-all`); --no-* still valid here.
@@ -2123,18 +2153,50 @@ PluginComponent {
         var cmd = root._lockedCmd(args.join(" "));
         var sweep = root.extSweepProviders;
         root._invalidateExtStamps(sweep.map(function (sp) { return sp.id; }));
-        for (var i = 0; i < sweep.length; i++)
-            cmd += "; echo; echo '── " + sweep[i].label + " ──'; "
-                + root._envPrefix(sweep[i]) + sweep[i].applyAll.map(_shq).join(" ");
+        for (var i = 0; i < sweep.length; i++) {
+            var bulk = root._bulkShellFor(sweep[i]);
+            if (bulk !== "")
+                cmd += "; echo; echo '── " + sweep[i].label + " ──'; " + bulk;
+        }
         root._runTerminalShell(cmd, "Update All", false);
     }
 
     // Apply everything from one external provider.
+    // Bulk apply for one source, built from what is ACTUALLY ON SCREEN.
+    //
+    // A source's applyAll is usually a blanket command — `dms plugins update
+    // --all`, `mise upgrade`, `npm --global update` — which ignores everything
+    // the widget filtered out. Holding a plugin hid it from the list but a bulk
+    // button still told the tool to update it, so the hold looked like it had
+    // been quietly overruled. Expanding applyOne over the visible items instead
+    // makes the list the contract: what you can see is what gets updated.
+    //
+    // Sources without an applyOne (nothing per-item to expand) keep using their
+    // applyAll — there is nothing better available for them.
+    function _bulkShellFor(p) {
+        if (!p)
+            return "";
+        var env = root._envPrefix(p);
+        var items = root.extItems(p.id);
+        if (p.applyOne && items.length > 0) {
+            var parts = [];
+            for (var i = 0; i < items.length; i++) {
+                var argv = root._applyOneArgv(p, items[i]);
+                if (argv && argv.length > 0)
+                    parts.push(env + argv.map(_shq).join(" "));
+            }
+            if (parts.length > 0)
+                return parts.join("; ");
+        }
+        return p.applyAll ? (env + p.applyAll.map(_shq).join(" ")) : "";
+    }
+
     function updateExt(p) {
-        if (!p || !p.applyAll)
+        var cmd = root._bulkShellFor(p);
+        if (cmd === "")
             return;
         root._invalidateExtStamps([p.id]);
-        root._runTerminalShell(root._envPrefix(p) + p.applyAll.map(_shq).join(" "), p.label, true);
+        root._runTerminalShell(cmd, p.label, true);
     }
     function updatePacman() {
         _beginUpgrade(_namesOf(pacmanUpdatesShown));

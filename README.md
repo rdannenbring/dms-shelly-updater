@@ -38,12 +38,13 @@ off as worked examples to copy. See [Adding your own sources](#adding-your-own-s
   with an option to exclude devel / `-git` AUR packages
 - **Two built-in non-Shelly sources**, each with its own settings toggle, on by default, and each
   hidden automatically when its command isn't installed:
-  - **DMS plugins** (`dms`) — updates to your installed DankMaterialShell plugins. Plugins you're
-    *developing* are skipped by default (**Ignore plugins you're developing**): a symlinked plugin
-    folder is a local checkout following your own fork or branch, so it can never match what the
-    registry compares it against and would sit in the list permanently, reported as updatable but
-    impossible to update. That also covers Shelly Updater itself, which is symlinked while you work
-    on it — and updating a plugin reloads it mid-run anyway
+  - **DMS plugins** (`dms`) — updates to your installed DankMaterialShell plugins. Checkouts an
+    update can't actually move are skipped by default (**Ignore plugins you've customized**): one on
+    a branch with no counterpart on `origin`, tracking a fork, or carrying local edits or unpushed
+    commits. `dms plugins update` pulls the branch you're *on*, so for these it reports success and
+    changes nothing, leaving them listed as updatable forever. Only local git refs are consulted, so
+    the test costs no network. Shelly Updater excludes *itself* separately — updating a plugin
+    rewrites its directory and DMS reloads it mid-run
   - **Device firmware** (`fwupdmgr`) — fwupd/LVFS updates. **Listing only**: firmware is never applied
     silently and is never swept up by *Update All*. Applying it always opens a terminal and runs
     `fwupdmgr`'s own prompts, because a bad flash is the one update here that can brick hardware
