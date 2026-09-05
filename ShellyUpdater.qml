@@ -3824,7 +3824,7 @@ PluginComponent {
         readonly property bool showFail: !busyState && root.failureCount > 0
         readonly property bool showUpd: !busyState && root.updateCount > 0
         readonly property bool showIdle: !busyState && !showFail && !showUpd
-        readonly property int pillIconSize: Theme.barIconSize(root.barThickness, -4, root.barConfig?.noBackground)
+        readonly property int pillIconSize: root.iconSize
 
         implicitWidth: layout.implicitWidth
         implicitHeight: layout.implicitHeight
