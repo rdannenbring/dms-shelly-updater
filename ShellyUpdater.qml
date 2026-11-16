@@ -323,6 +323,30 @@ PluginComponent {
     }
     readonly property var aurUpdatesEffective: excludeDevelAur ? aurUpdates.filter(u => !root._isDevelAur(u)) : aurUpdates
 
+    // Format an "old -> new" version pair cleanly, handling missing versions,
+    // identical versions (commit-only updates, rebuilds) and VCS labels without
+    // showing confusing artifacts like "X -> X" or "X -> ?".
+    function _formatVersionPair(oldV, newV, sep) {
+        var s = (sep !== undefined) ? sep : " → ";
+        var o = (oldV !== undefined && oldV !== null) ? String(oldV).trim() : "";
+        var n = (newV !== undefined && newV !== null) ? String(newV).trim() : "";
+        var hasOld = o !== "" && o !== "?";
+        var hasNew = n !== "" && n !== "?";
+        if (hasOld && hasNew) {
+            if (o === n)
+                return o + s + "update available";
+            var displayNew = (n === "latest-commit") ? "latest" : n;
+            return o + s + displayNew;
+        }
+        if (hasOld)
+            return o + s + "update available";
+        if (hasNew) {
+            var disp = (n === "latest-commit") ? "latest" : n;
+            return (s.indexOf("  ") !== -1 ? "→  " : "→ ") + disp;
+        }
+        return "update available";
+    }
+
     // Held/ignored packages (shelly ignore list) — pinned by the user so they
     // stay out of the actionable count and list. pacman/AUR only.
     property var ignoredPackages: []
@@ -1596,8 +1620,32 @@ PluginComponent {
     function _normalize(o, src) {
         var name = o.Name || o.name || o.Application || o.AppId || o.Id || "";
         var id = o.Application || o.AppId || o.Id || o.PackageBase || o.id || name;
-        var oldV = o.CurrentVersion || o.OldVersion || o.Version || o.currentVersion || "";
-        var newV = o.NewVersion || o.newVersion || o.Version || "";
+        var oldV = o.CurrentVersion || o.OldVersion || o.currentVersion || o.oldVersion || "";
+        var newV = o.NewVersion || o.newVersion || "";
+
+        // If only o.Version was provided on the record:
+        if (!oldV && !newV && (o.Version || o.version)) {
+            var v = o.Version || o.version || "";
+            // For Flatpak and AUR, Version indicates the currently installed version.
+            if (src === "flatpak" || src === "aur")
+                oldV = v;
+            else
+                newV = v;
+        } else if (o.Version || o.version) {
+            var ver = o.Version || o.version;
+            if (!oldV && ver !== newV)
+                oldV = ver;
+            else if (!newV && ver !== oldV)
+                newV = ver;
+        }
+
+        // Commit-based updates (e.g. Flatpak runtimes without a semver bump)
+        if (o.LatestCommit && (!newV || newV === oldV)) {
+            newV = "commit " + String(o.LatestCommit).substring(0, 7);
+        } else if (oldV && newV && oldV === newV) {
+            newV = "";
+        }
+
         var desc = o.Description || o.description || "";
         var repo = o.Repository || o.repository || o.Origin || o.origin || "";
         return {
@@ -2708,7 +2756,7 @@ PluginComponent {
                 return;
             fields.push({ label: label, value: v, mono: mono === true, link: link === true });
         }
-        var verArrow = (item.oldVersion || "?") + "  →  " + (item.newVersion || "?");
+        var verArrow = root._formatVersionPair(item.oldVersion, item.newVersion, "  →  ");
         var desc = item.description || "";
 
         if (item.source === "pacman") {
@@ -3824,7 +3872,7 @@ PluginComponent {
         readonly property bool showFail: !busyState && root.failureCount > 0
         readonly property bool showUpd: !busyState && root.updateCount > 0
         readonly property bool showIdle: !busyState && !showFail && !showUpd
-        readonly property int pillIconSize: Theme.barIconSize(root.barThickness, -4, root.barConfig?.noBackground)
+        readonly property int pillIconSize: root.iconSize
 
         implicitWidth: layout.implicitWidth
         implicitHeight: layout.implicitHeight
@@ -4707,13 +4755,7 @@ PluginComponent {
                                         return modelData.description
                                             ? modelData.versionText + "  ·  " + modelData.description
                                             : modelData.versionText;
-                                    // Some tools report only the available
-                                    // version (npm omits `current` for a
-                                    // partially-installed global), and "? → x"
-                                    // reads like an error rather than a fact.
-                                    var v = modelData.oldVersion
-                                        ? (modelData.oldVersion + " → " + (modelData.newVersion || "?"))
-                                        : (modelData.newVersion ? ("→ " + modelData.newVersion) : "update available");
+                                    var v = root._formatVersionPair(modelData.oldVersion, modelData.newVersion, " → ");
                                     var ds = Number(modelData.downloadSize) || 0;
                                     if (ds > 0)
                                         v += "  ·  " + root._fmtBytes(ds);
@@ -5910,7 +5952,7 @@ PluginComponent {
                             StyledText {
                                 width: parent.width
                                 text: {
-                                    var ver = (modelData.oldVersion || "?") + "  →  " + (modelData.newVersion || "?");
+                                    var ver = root._formatVersionPair(modelData.oldVersion, modelData.newVersion, "  →  ");
                                     if (isFailed) {
                                         var hasVer = (modelData.oldVersion || "") !== "" || (modelData.newVersion || "") !== "";
                                         return (modelData.reason || "Failed") + (hasVer ? "  ·  " + ver : "");
@@ -6016,7 +6058,7 @@ PluginComponent {
                 StyledText {
                     width: parent.width
                     visible: fdv.hasVersions
-                    text: (fdv.entry.oldVersion || "?") + "  →  " + (fdv.entry.newVersion || "?")
+                    text: root._formatVersionPair(fdv.entry.oldVersion, fdv.entry.newVersion, "  →  ")
                     font.pixelSize: Theme.fontSizeSmall
                     color: Theme.primary
                     elide: Text.ElideRight
@@ -6890,9 +6932,17 @@ PluginComponent {
                                             return "";
                                         if (u.versionText)
                                             return u.versionText + " (held)";
+                                        if (u.oldVersion && u.newVersion && u.oldVersion !== u.newVersion) {
+                                            var dn = (u.newVersion === "latest-commit") ? "latest" : u.newVersion;
+                                            return u.oldVersion + " → " + dn + " (held)";
+                                        }
                                         if (u.oldVersion)
-                                            return u.oldVersion + " → " + (u.newVersion || "?") + " (held)";
-                                        return u.newVersion ? ("→ " + u.newVersion + " (held)") : "update available (held)";
+                                            return u.oldVersion + " (held)";
+                                        if (u.newVersion) {
+                                            var dn2 = (u.newVersion === "latest-commit") ? "latest" : u.newVersion;
+                                            return "→ " + dn2 + " (held)";
+                                        }
+                                        return "update available (held)";
                                     }
                                     font.pixelSize: Theme.fontSizeSmall
                                     color: Theme.warning
