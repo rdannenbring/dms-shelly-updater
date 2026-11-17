@@ -48,11 +48,36 @@ PluginComponent {
         stderr: StdioCollector { onStreamFinished: {} }
     }
 
+    Connections {
+        target: typeof PluginService !== "undefined" ? PluginService : null
+        function onPluginDataChanged(changedPluginId) {
+            if (changedPluginId === root.pluginName && (!root.pluginData || Object.keys(root.pluginData).length === 0)) {
+                if (typeof SettingsData !== "undefined" && SettingsData.getPluginSettingsForPlugin)
+                    root._pdFallback = SettingsData.getPluginSettingsForPlugin(root.pluginName);
+                else
+                    pluginSettingsProc.running = true;
+            }
+        }
+    }
+
     // ---- Settings (bound to pluginData so they react to changes) ----
     readonly property bool autoCheck: _pd.autoCheck !== undefined ? _pd.autoCheck : true
     readonly property int checkFrequency: parseInt(_pd.checkFrequency || "60") // minutes
     readonly property bool checkAtStartup: _pd.checkAtStartup !== undefined ? _pd.checkAtStartup : true
     readonly property bool confirmations: _pd.confirmations !== undefined ? _pd.confirmations : true
+    function setConfirmations(val) {
+        var b = val === true;
+        if (pluginService && pluginService.savePluginData) {
+            pluginService.savePluginData(pluginId || pluginName, "confirmations", b);
+        } else if (typeof PluginService !== "undefined" && PluginService.savePluginData) {
+            PluginService.savePluginData(pluginName, "confirmations", b);
+        } else if (typeof SettingsData !== "undefined" && SettingsData.setPluginSetting) {
+            SettingsData.setPluginSetting(pluginName, "confirmations", b);
+        }
+        var copy = Object.assign({}, root._pdFallback || {});
+        copy.confirmations = b;
+        root._pdFallback = copy;
+    }
     readonly property bool enableAur: _pd.enableAur !== undefined ? _pd.enableAur : true
     readonly property bool enableFlatpak: _pd.enableFlatpak !== undefined ? _pd.enableFlatpak : true
     readonly property bool enableAppimage: _pd.enableAppimage !== undefined ? _pd.enableAppimage : false
@@ -3809,6 +3834,71 @@ PluginComponent {
         }
     }
 
+    // Reusable menu toggle row (matching MenuItem styling with a DankToggle).
+    component MenuToggleItem: Rectangle {
+        id: mti
+        property string itemIcon: ""
+        property string itemLabel: ""
+        property string itemSubtitle: ""
+        property bool checked: false
+        signal toggled(bool isChecked)
+        width: parent ? parent.width - (parent.leftPadding || 0) - (parent.rightPadding || 0) : 0
+        height: itemSubtitle !== "" ? 54 : 44
+        radius: Theme.cornerRadius
+        color: mtHover.containsMouse ? Theme.primaryHoverLight : "transparent"
+        Behavior on color { ColorAnimation { duration: Theme.shortDuration } }
+
+        MouseArea {
+            id: mtHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: mti.toggled(!mti.checked)
+        }
+        Row {
+            anchors.left: parent.left
+            anchors.leftMargin: Theme.spacingM
+            anchors.right: mtToggle.left
+            anchors.rightMargin: Theme.spacingS
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Theme.spacingM
+            DankIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                name: mti.itemIcon
+                size: Theme.iconSize - 2
+                color: root.menuIconColor
+            }
+            Column {
+                width: Math.max(0, parent.width - (Theme.iconSize - 2) - Theme.spacingM)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 1
+                StyledText {
+                    width: parent.width
+                    text: mti.itemLabel
+                    font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.surfaceText
+                    elide: Text.ElideRight
+                }
+                StyledText {
+                    width: parent.width
+                    text: mti.itemSubtitle
+                    visible: mti.itemSubtitle !== ""
+                    font.pixelSize: Theme.fontSizeSmall
+                    color: Theme.surfaceVariantText
+                    elide: Text.ElideRight
+                }
+            }
+        }
+        DankToggle {
+            id: mtToggle
+            anchors.right: parent.right
+            anchors.rightMargin: Theme.spacingM
+            anchors.verticalCenter: parent.verticalCenter
+            checked: mti.checked
+            onToggled: isChecked => mti.toggled(isChecked)
+        }
+    }
+
     // =====================================================================
     // Bar pill
     // =====================================================================
@@ -4268,14 +4358,28 @@ PluginComponent {
             onTextEdited: uv.filterText = text
         }
 
-        // Sort selector (type / name).
-        SortChips {
-            id: updSort
+        // Sort selector (type / name) + --no-confirm toggle.
+        Item {
+            width: uv.contentWidth
             visible: !uv.embedded && uv.allItems.length > 0
-            height: visible ? implicitHeight : 0
-            activeKey: "type"
-            asc: true
-            options: [ { key: "type", label: "Type" }, { key: "name", label: "Name" } ]
+            height: visible ? 24 : 0
+            SortChips {
+                id: updSort
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                activeKey: "type"
+                asc: true
+                options: [ { key: "type", label: "Type" }, { key: "name", label: "Name" } ]
+            }
+            FilterChip {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                label: "--no-confirm"
+                icon: "bolt"
+                activeColor: Theme.primary
+                active: !root.confirmations
+                onToggled: root.setConfirmations(!root.confirmations)
+            }
         }
 
         // Failure banner — appears whenever the last upgrade left
@@ -4995,6 +5099,16 @@ PluginComponent {
                     ? String(root.extItems(modelData.id).length) : ""
                 onTriggered: { root.updateExt(modelData); mv.dismissRequested(); }
             }
+        }
+
+        MenuToggleItem {
+            itemIcon: "bolt"
+            itemLabel: "No-confirm (--no-confirm)"
+            itemSubtitle: (!root.confirmations && root.alwaysConfirmKernel && root.hasKernelUpdate)
+                ? "Active (kernel updates still confirm)"
+                : "Skip confirmation prompts when updating"
+            checked: !root.confirmations
+            onToggled: isChecked => root.setConfirmations(!isChecked)
         }
 
         Rectangle { width: mv.contentWidth; height: 1; color: Theme.outline; opacity: 0.3 }
